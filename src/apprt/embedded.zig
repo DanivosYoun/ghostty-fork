@@ -66,6 +66,15 @@ pub const App = struct {
             apprt.ClipboardRequestType,
         ) callconv(.c) void,
 
+        /// CNDF: Raw PTY output tap. Called on the termio read thread BEFORE
+        /// the VT stream parses bytes. If null, no tap is performed.
+        /// Must match the C layout order in ghostty_runtime_config_s.
+        read_pty: ?*const fn (
+            SurfaceUD,
+            [*]const u8,
+            usize,
+        ) callconv(.c) void = null,
+
         /// Write the clipboard value.
         write_clipboard: *const fn (
             SurfaceUD,
@@ -643,6 +652,14 @@ pub const Surface = struct {
         };
 
         func(self.userdata, process_alive);
+    }
+
+    /// CNDF: Forward raw PTY bytes to the embedder's read_pty tap (if any).
+    /// Called from the termio read thread. Must be cheap and non-blocking.
+    pub fn readPtyTap(self: *const Surface, buf: []const u8) void {
+        const func = self.app.opts.read_pty orelse return;
+        if (buf.len == 0) return;
+        func(self.userdata, buf.ptr, buf.len);
     }
 
     pub fn getContentScale(self: *const Surface) !apprt.ContentScale {

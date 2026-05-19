@@ -987,6 +987,12 @@ typedef void (*ghostty_runtime_close_surface_cb)(void*, bool);
 typedef bool (*ghostty_runtime_action_cb)(ghostty_app_t,
                                           ghostty_target_s,
                                           ghostty_action_s);
+// CNDF: Raw PTY output tap for session sharing. Called on the termio read
+// thread BEFORE bytes are parsed by the VT stream. May be NULL to disable.
+// `userdata` is the surface userdata (per-surface void*).
+typedef void (*ghostty_runtime_read_pty_cb)(void* userdata,
+                                            const char* bytes,
+                                            size_t len);
 
 typedef struct {
   void* userdata;
@@ -995,6 +1001,7 @@ typedef struct {
   ghostty_runtime_action_cb action_cb;
   ghostty_runtime_read_clipboard_cb read_clipboard_cb;
   ghostty_runtime_confirm_read_clipboard_cb confirm_read_clipboard_cb;
+  ghostty_runtime_read_pty_cb read_pty_cb;
   ghostty_runtime_write_clipboard_cb write_clipboard_cb;
   ghostty_runtime_close_surface_cb close_surface_cb;
 } ghostty_runtime_config_s;

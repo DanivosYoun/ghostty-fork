@@ -685,6 +685,18 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
 
 /// Process output from readdata but the lock is already held.
 fn processOutputLocked(self: *Termio, buf: []const u8) void {
+    // CNDF: Raw PTY tap for session sharing. Fire BEFORE VT parsing so
+    // observers receive exactly what the shell wrote. Runtime support is
+    // opt-in via @hasDecl so non-embedded apprts (gtk, none, browser) are
+    // unaffected. Runs on the io-reader thread; embedder must not block.
+    {
+        const rt_surface = self.surface_mailbox.surface.rt_surface;
+        const RtSurface = @TypeOf(rt_surface.*);
+        if (@hasDecl(RtSurface, "readPtyTap")) {
+            rt_surface.readPtyTap(buf);
+        }
+    }
+
     // Schedule a render. We can call this first because we have the lock.
     self.terminal_stream.handler.queueRender() catch unreachable;
 
