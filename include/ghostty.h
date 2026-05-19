@@ -529,6 +529,14 @@ typedef struct {
   uint32_t cell_height_px;
 } ghostty_surface_size_s;
 
+// CNDF: cursor viewport position for typing-attribution chip anchoring.
+typedef struct {
+  size_t cell_col;     // 0-indexed column of cursor in viewport
+  size_t cell_row;     // 0-indexed row of cursor in viewport (0 = top)
+  uint32_t cell_width_px;
+  uint32_t cell_height_px;
+} ghostty_cursor_position_s;
+
 // Config types
 
 // config.Path
@@ -1198,6 +1206,10 @@ GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
+// Returns the current viewport cursor position. Returns a zeroed struct
+// if the surface is null or cursor position is unavailable.
+// CNDF: added for session-share typing-attribution chip anchoring.
+GHOSTTY_API ghostty_cursor_position_s ghostty_surface_cursor_position(ghostty_surface_t);
 GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
 GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,

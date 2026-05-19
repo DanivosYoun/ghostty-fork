@@ -1566,6 +1566,14 @@ pub const CAPI = struct {
         cell_height_px: u32,
     };
 
+    // CNDF: cursor viewport position for typing-attribution chip anchoring.
+    const CursorPosition = extern struct {
+        cell_col: usize,
+        cell_row: usize,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    };
+
     // ghostty_clipboard_content_s
     //
     // One representation of clipboard contents. The data is binary-safe
@@ -2042,6 +2050,22 @@ pub const CAPI = struct {
         };
 
         return .fromSlice(copy);
+    }
+
+    /// CNDF: Return the cursor's current viewport position. Used by the host
+    /// app to anchor the session-share typing-attribution chip near the caret.
+    /// Safe to call at any time; locks the renderer state mutex briefly.
+    export fn ghostty_surface_cursor_position(surface: *Surface) CursorPosition {
+        const core = &surface.core_surface;
+        core.renderer_state.mutex.lock();
+        const cursor = core.renderer_state.terminal.screens.active.cursor;
+        core.renderer_state.mutex.unlock();
+        return .{
+            .cell_col = @intCast(cursor.x),
+            .cell_row = @intCast(cursor.y),
+            .cell_width_px = core.size.cell.width,
+            .cell_height_px = core.size.cell.height,
+        };
     }
 
     /// Update the color scheme of the surface.
