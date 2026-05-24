@@ -1772,6 +1772,79 @@ pub const CAPI = struct {
         surface.core_surface.io.processOutput(bytes[0..len]);
     }
 
+    /// CNDF: Serialize the surface's current active screen into a VT replay
+    /// (palette + modes + cell contents + SGR + cursor position) suitable for
+    /// re-injection into another Ghostty surface via
+    /// `ghostty_surface_inject_output`. Used by the session-share host to
+    /// deliver an initial-snapshot frame to newly-joined viewers, eliminating
+    /// the black-screen-until-first-keystroke RC.
+    ///
+    /// Writes up to `buf_cap` bytes into `buf` and returns the total bytes
+    /// that would have been written (regardless of `buf_cap`). If the return
+    /// value > `buf_cap`, the output was truncated and the caller may retry
+    /// with a larger buffer. Passing `buf=null` / `buf_cap=0` is supported as
+    /// a size query.
+    ///
+    /// On allocation or formatter failure, logs a warning and returns 0.
+    /// Safe to call from any thread; briefly locks the renderer state mutex
+    /// across the format operation so the snapshot is internally consistent.
+    export fn ghostty_surface_dump_screen(
+        surface: *Surface,
+        buf: ?[*]u8,
+        buf_cap: usize,
+    ) usize {
+        const core = &surface.core_surface;
+
+        // Build the dump under the renderer mutex so the screen we serialize
+        // is not mutated mid-format. The mutex also protects the palette and
+        // mode state we read out of the terminal.
+        core.renderer_state.mutex.lock();
+        defer core.renderer_state.mutex.unlock();
+
+        const term = core.renderer_state.terminal;
+
+        // Allocate a temporary buffer via the C allocator so we don't depend
+        // on Surface lifetime. We always need to fully format to know the
+        // total byte count, then we memcpy as much as fits into the caller's
+        // buffer.
+        var allocating: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+        defer allocating.deinit();
+
+        var formatter: terminal.formatter.TerminalFormatter = .init(term, .{
+            .emit = .vt,
+            .unwrap = false,
+            .trim = false,
+            // Use the live palette so emitted SGR colors map back to the
+            // same RGB the host is currently rendering with.
+            .palette = &term.colors.palette.current,
+        });
+        // Reconstruct the screen as faithfully as possible: palette, modes,
+        // scrolling region, tabstops, pwd, keyboard modes, plus full screen
+        // contents and cursor position.
+        formatter.extra = .all;
+
+        formatter.format(&allocating.writer) catch |err| {
+            log.warn(
+                "ghostty_surface_dump_screen: formatter failed err={}",
+                .{err},
+            );
+            return 0;
+        };
+
+        const out = allocating.writer.buffered();
+        const total = out.len;
+
+        // Copy whatever fits into the caller's buffer. If buf is null or
+        // buf_cap is 0, we still return the required total so the caller can
+        // size their buffer correctly on the next call.
+        if (buf) |dst| {
+            const copy_len = @min(total, buf_cap);
+            if (copy_len > 0) @memcpy(dst[0..copy_len], out[0..copy_len]);
+        }
+
+        return total;
+    }
+
     /// Update the color scheme of the surface.
     export fn ghostty_surface_set_color_scheme(surface: *Surface, scheme_raw: c_int) void {
         const scheme = std.meta.intToEnum(apprt.ColorScheme, scheme_raw) catch {

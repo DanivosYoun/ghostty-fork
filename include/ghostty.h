@@ -1114,6 +1114,21 @@ ghostty_cursor_position_s ghostty_surface_cursor_position(ghostty_surface_t);
 void ghostty_surface_inject_output(ghostty_surface_t,
                                    const uint8_t* bytes,
                                    size_t len);
+// CNDF: Serialize the surface's current active screen state into a VT replay
+// (palette + modes + cell contents + SGR + cursor position). Writes up to
+// buf_cap bytes into buf and returns the total bytes that would have been
+// written. If the return value is greater than buf_cap, the caller's buffer
+// was too small and the output was truncated; the caller may re-call with a
+// larger buffer. Passing buf=NULL/buf_cap=0 is supported as a size query.
+//
+// Used by the session-share host to send a viewer-join initial snapshot, so
+// the viewer sees the current host terminal contents immediately instead of
+// a black screen until the next host-side action triggers PTY output.
+//
+// Safe to call from any thread; briefly locks the renderer state mutex.
+size_t ghostty_surface_dump_screen(ghostty_surface_t,
+                                   uint8_t* buf,
+                                   size_t buf_cap);
 void ghostty_surface_set_color_scheme(ghostty_surface_t,
                                       ghostty_color_scheme_e);
 ghostty_input_mods_e ghostty_surface_key_translation_mods(ghostty_surface_t,
