@@ -683,13 +683,46 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
     self.processOutputLocked(buf);
 }
 
+/// CNDF: Process output WITHOUT firing the session-share read_pty tap.
+///
+/// Used by the session-share viewer path
+/// (`ghostty_surface_inject_output`). The viewer feeds host bytes into a
+/// silent-PTY surface via this entry point; if those bytes also fired the
+/// read_pty tap, the viewer's apprt would observe its own injected output
+/// and (when the same Surface registry is shared with hosts) re-forward
+/// it onto the share wire, producing an unbounded echo loop. See
+/// CNDFTerminalTools PR for the cross-surface RC.
+///
+/// IMPORTANT: this is only safe for *injection* paths — never call it
+/// from the PTY read thread; the host's real PTY data must always reach
+/// the tap so observers (session-share host, debug tooling) see it.
+pub fn processOutputNoTap(self: *Termio, buf: []const u8) void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    self.processOutputLockedTapped(buf, false);
+}
+
 /// Process output from readdata but the lock is already held.
 fn processOutputLocked(self: *Termio, buf: []const u8) void {
+    self.processOutputLockedTapped(buf, true);
+}
+
+/// Process output from readdata, lock held, optionally firing the
+/// session-share read_pty tap. The `fire_tap` parameter exists so the
+/// CNDF inject-output path can deliver bytes into the VT stream without
+/// generating an echo through the embedder's PTY observer (see
+/// `processOutputNoTap`).
+fn processOutputLockedTapped(self: *Termio, buf: []const u8, fire_tap: bool) void {
     // CNDF: Raw PTY tap for session sharing. Fire BEFORE VT parsing so
     // observers receive exactly what the shell wrote. Runtime support is
     // opt-in via @hasDecl so non-embedded apprts (gtk, none, browser) are
     // unaffected. Runs on the io-reader thread; embedder must not block.
-    {
+    //
+    // `fire_tap` is false on the `ghostty_surface_inject_output` path:
+    // we are *replaying* bytes the host already sent us, so firing the
+    // tap would round-trip the same bytes through the embedder and (in
+    // a session-share viewer) loop them straight back onto the wire.
+    if (fire_tap) {
         const rt_surface = self.surface_mailbox.surface.rt_surface;
         const RtSurface = @TypeOf(rt_surface.*);
         if (@hasDecl(RtSurface, "readPtyTap")) {

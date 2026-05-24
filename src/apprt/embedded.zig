@@ -1754,22 +1754,30 @@ pub const CAPI = struct {
     /// as if they had arrived from a real PTY child. Used by the session-share
     /// viewer to render the host's terminal output through a real Ghostty
     /// terminal emulator (ANSI, cursor, scrollback, resize) instead of a raw
-    /// text dump. Safe to call from any thread; processOutput acquires the
-    /// renderer mutex internally.
+    /// text dump. Safe to call from any thread; processOutputNoTap acquires
+    /// the renderer mutex internally.
     ///
     /// The surface must still be created the normal way; we recommend pairing
     /// this with a benign command (e.g. `tail -f /dev/null`) so the spawned
     /// PTY child is silent and the only bytes reaching the VT stream are the
-    /// ones the embedder injects here. Injected bytes still fire the
-    /// `read_pty_cb` tap (see Termio.processOutputLocked), so embedders that
-    /// also tap their own output should filter by surface to avoid loops.
+    /// ones the embedder injects here.
+    ///
+    /// Echo-loop safety: this path uses `processOutputNoTap`, which skips
+    /// the session-share `read_pty_cb` tap that real PTY reads fire. Without
+    /// that skip, every injected viewer chunk would call the tap with the
+    /// viewer surface's userdata — and because both host and viewer
+    /// surfaces share one runtime callback, any code path that also
+    /// observes host output would see the viewer's bytes and (in the share
+    /// host) re-send them on the wire, producing an unbounded echo loop.
+    /// See vendor/ghostty/src/termio/Termio.zig::processOutputNoTap for the
+    /// detailed rationale and the corresponding CNDFTerminalTools PR.
     export fn ghostty_surface_inject_output(
         surface: *Surface,
         bytes: [*]const u8,
         len: usize,
     ) void {
         if (len == 0) return;
-        surface.core_surface.io.processOutput(bytes[0..len]);
+        surface.core_surface.io.processOutputNoTap(bytes[0..len]);
     }
 
     /// CNDF: Serialize the surface's current active screen into a VT replay
