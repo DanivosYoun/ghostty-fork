@@ -1106,6 +1106,14 @@ ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 // if the surface is null or cursor position is unavailable.
 // CNDF: added for session-share typing-attribution chip anchoring.
 ghostty_cursor_position_s ghostty_surface_cursor_position(ghostty_surface_t);
+// CNDF: Inject raw PTY-style bytes into the surface's VT stream as if they
+// arrived from a real PTY child. Used by the session-share viewer to render
+// host terminal output through a real Ghostty surface. Safe from any thread.
+// Pair with a silent benign command so the spawned PTY does not race with
+// injected bytes.
+void ghostty_surface_inject_output(ghostty_surface_t,
+                                   const uint8_t* bytes,
+                                   size_t len);
 void ghostty_surface_set_color_scheme(ghostty_surface_t,
                                       ghostty_color_scheme_e);
 ghostty_input_mods_e ghostty_surface_key_translation_mods(ghostty_surface_t,

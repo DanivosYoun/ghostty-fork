@@ -1750,6 +1750,28 @@ pub const CAPI = struct {
         };
     }
 
+    /// CNDF: Inject raw PTY-style bytes directly into the surface's VT stream
+    /// as if they had arrived from a real PTY child. Used by the session-share
+    /// viewer to render the host's terminal output through a real Ghostty
+    /// terminal emulator (ANSI, cursor, scrollback, resize) instead of a raw
+    /// text dump. Safe to call from any thread; processOutput acquires the
+    /// renderer mutex internally.
+    ///
+    /// The surface must still be created the normal way; we recommend pairing
+    /// this with a benign command (e.g. `tail -f /dev/null`) so the spawned
+    /// PTY child is silent and the only bytes reaching the VT stream are the
+    /// ones the embedder injects here. Injected bytes still fire the
+    /// `read_pty_cb` tap (see Termio.processOutputLocked), so embedders that
+    /// also tap their own output should filter by surface to avoid loops.
+    export fn ghostty_surface_inject_output(
+        surface: *Surface,
+        bytes: [*]const u8,
+        len: usize,
+    ) void {
+        if (len == 0) return;
+        surface.core_surface.io.processOutput(bytes[0..len]);
+    }
+
     /// Update the color scheme of the surface.
     export fn ghostty_surface_set_color_scheme(surface: *Surface, scheme_raw: c_int) void {
         const scheme = std.meta.intToEnum(apprt.ColorScheme, scheme_raw) catch {
