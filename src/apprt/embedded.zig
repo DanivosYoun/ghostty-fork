@@ -1826,10 +1826,26 @@ pub const CAPI = struct {
             // same RGB the host is currently rendering with.
             .palette = &term.colors.palette.current,
         });
-        // Reconstruct the screen as faithfully as possible: palette, modes,
+        // Reconstruct the screen as faithfully as possible: modes,
         // scrolling region, tabstops, pwd, keyboard modes, plus full screen
         // contents and cursor position.
+        //
+        // CNDF: We intentionally OMIT palette emit (OSC 4 per-entry, 256
+        // entries) from the snapshot. Reason: the viewer surface processes
+        // the dump synchronously inside `ghostty_surface_inject_output`,
+        // which holds the renderer mutex while the VT parser fires one
+        // `surface_mailbox.push` per `color_change`. With a 64-slot
+        // mailbox and a main-thread consumer that is itself the caller of
+        // `inject_output`, 256 idempotent palette notifications can
+        // deadlock the surface mailbox even with the idempotent-writer
+        // defense in `stream_handler.zig`. Viewers render correctly
+        // against their local palette config; share semantics never
+        // required the host palette to round-trip. If a future use case
+        // needs the palette on the wire, add a dedicated
+        // `ghostty_surface_dump_screen_with_palette` rather than
+        // re-enabling the default.
         formatter.extra = .all;
+        formatter.extra.palette = false;
 
         formatter.format(&allocating.writer) catch |err| {
             log.warn(

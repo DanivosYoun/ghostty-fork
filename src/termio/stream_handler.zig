@@ -135,6 +135,29 @@ pub const StreamHandler = struct {
         }
     }
 
+    /// CNDF: Push an idempotent surface message that is safe to drop
+    /// if the surface mailbox is full. Use this for notifications whose
+    /// effect is already applied to terminal state synchronously and
+    /// whose semantics are "last write wins" — primarily palette
+    /// `color_change` notifications.
+    ///
+    /// The regular `surfaceMessageWriter` falls back to `.forever` if
+    /// the 64-slot mailbox is full, which deadlocks when the consumer
+    /// (main/app thread) is itself the producer's caller — exactly the
+    /// case for `ghostty_surface_inject_output` driving a snapshot
+    /// replay that contains a 256-entry OSC 4 palette dump. The
+    /// palette is already updated on the terminal struct (see callers
+    /// at lines 1228-1230) before this notification is sent, so the
+    /// embedder can re-derive current state at any time; missing a
+    /// notification only delays the next render reaction, never
+    /// corrupts state.
+    inline fn surfaceMessageWriterIdempotent(
+        self: *StreamHandler,
+        msg: apprt.surface.Message,
+    ) void {
+        _ = self.surface_mailbox.push(msg, .{ .instant = {} });
+    }
+
     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
         self.termio_mailbox.send(msg, self.renderer_state.mutex);
         self.termio_messaged = true;
@@ -1247,8 +1270,12 @@ pub const StreamHandler = struct {
                         .special => log.info("setting special colors not implemented", .{}),
                     }
 
-                    // Notify the surface of the color change
-                    self.surfaceMessageWriter(.{ .color_change = .{
+                    // Notify the surface of the color change. Use the
+                    // idempotent writer: palette state is already updated
+                    // above; the notification may be dropped under burst
+                    // load (e.g. 256-entry snapshot replay) without losing
+                    // correctness — see surfaceMessageWriterIdempotent.
+                    self.surfaceMessageWriterIdempotent(.{ .color_change = .{
                         .target = set.target,
                         .color = set.color,
                     } });
@@ -1259,7 +1286,7 @@ pub const StreamHandler = struct {
                         self.terminal.flags.dirty.palette = true;
                         self.terminal.colors.palette.reset(i);
 
-                        self.surfaceMessageWriter(.{
+                        self.surfaceMessageWriterIdempotent(.{
                             .color_change = .{
                                 .target = target,
                                 .color = self.terminal.colors.palette.current[i],
@@ -1271,7 +1298,7 @@ pub const StreamHandler = struct {
                             self.terminal.colors.foreground.reset();
 
                             if (self.terminal.colors.foreground.default) |c| {
-                                self.surfaceMessageWriter(.{ .color_change = .{
+                                self.surfaceMessageWriterIdempotent(.{ .color_change = .{
                                     .target = target,
                                     .color = c,
                                 } });
@@ -1281,7 +1308,7 @@ pub const StreamHandler = struct {
                             self.terminal.colors.background.reset();
 
                             if (self.terminal.colors.background.default) |c| {
-                                self.surfaceMessageWriter(.{ .color_change = .{
+                                self.surfaceMessageWriterIdempotent(.{ .color_change = .{
                                     .target = target,
                                     .color = c,
                                 } });
@@ -1291,7 +1318,7 @@ pub const StreamHandler = struct {
                             self.terminal.colors.cursor.reset();
 
                             if (self.terminal.colors.cursor.default) |c| {
-                                self.surfaceMessageWriter(.{ .color_change = .{
+                                self.surfaceMessageWriterIdempotent(.{ .color_change = .{
                                     .target = target,
                                     .color = c,
                                 } });
@@ -1317,7 +1344,10 @@ pub const StreamHandler = struct {
                     while (mask_it.next()) |i| {
                         self.terminal.flags.dirty.palette = true;
                         self.terminal.colors.palette.reset(@intCast(i));
-                        self.surfaceMessageWriter(.{
+                        // Idempotent: palette is reset above; up to 256
+                        // notifications in one go must not deadlock the
+                        // 64-slot mailbox.
+                        self.surfaceMessageWriterIdempotent(.{
                             .color_change = .{
                                 .target = .{ .palette = @intCast(i) },
                                 .color = self.terminal.colors.palette.current[i],
