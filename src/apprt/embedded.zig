@@ -1028,9 +1028,7 @@ pub const Surface = struct {
     /// external_io=false 이면 null 반환 → 기존 exec backend 사용.
     /// external_io=true 이면 ExternalIo.Config 반환 → PTY-less surface.
     pub fn externalIoConfig(self: *const Surface) ?termio.ExternalIo.Config {
-        log.info("externalIoConfig: external_io_enabled={}", .{self.external_io_enabled});
         if (!self.external_io_enabled) return null;
-        log.info("externalIoConfig: returning external_io config (PTY-less)", .{});
         return .{
             .write_input_cb = self.app.opts.write_input_cb,
             .resize_cb = self.app.opts.resize_cb,

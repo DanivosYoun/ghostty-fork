@@ -79,10 +79,6 @@ pub fn threadEnter(
         .userdata = self.userdata,
     } };
     log.debug("external_io threadEnter: PTY-less surface ready", .{});
-    // 스파이크 진단: stderr 직접 출력
-    const stderr_file = std.posix.STDERR_FILENO;
-    const msg = "[ExternalIo] threadEnter OK: PTY-less surface active\n";
-    _ = std.posix.write(stderr_file, msg) catch {};
 }
 
 /// threadExit: no-op — 정리할 스레드/fd 가 없다.
