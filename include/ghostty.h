@@ -450,6 +450,9 @@ typedef struct {
   const char* initial_input;
   bool wait_after_command;
   ghostty_surface_context_e context;
+  // CNDF external_io: true → surface does not spawn a PTY.
+  // The embedder owns the PTY; ghostty handles rendering + key encoding only.
+  bool external_io;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1002,6 +1005,21 @@ typedef void (*ghostty_runtime_read_pty_cb)(void* userdata,
                                             const char* bytes,
                                             size_t len);
 
+// CNDF external_io: key input callback. ghostty encodes a key event into
+// UTF-8 / escape bytes and delivers them here instead of writing to the PTY.
+// Only called for surfaces created with external_io=true.
+// `userdata` is the surface userdata (per-surface void*).
+typedef void (*ghostty_runtime_write_input_cb)(void* userdata,
+                                               const char* bytes,
+                                               size_t len);
+
+// CNDF external_io: resize notification callback. Called when the terminal
+// grid is resized. The external PTY owner should forward TIOCSWINSZ.
+// Only called for surfaces created with external_io=true.
+typedef void (*ghostty_runtime_resize_cb)(void* userdata,
+                                          uint16_t cols,
+                                          uint16_t rows);
+
 typedef struct {
   void* userdata;
   bool supports_selection_clipboard;
@@ -1012,6 +1030,9 @@ typedef struct {
   ghostty_runtime_read_pty_cb read_pty_cb;
   ghostty_runtime_write_clipboard_cb write_clipboard_cb;
   ghostty_runtime_close_surface_cb close_surface_cb;
+  // CNDF external_io callbacks (may be NULL if external_io surfaces unused)
+  ghostty_runtime_write_input_cb write_input_cb;
+  ghostty_runtime_resize_cb resize_cb;
 } ghostty_runtime_config_s;
 
 // apprt.ipc.Target.Key

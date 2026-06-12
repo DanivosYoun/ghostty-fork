@@ -19,6 +19,7 @@ const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
 const configpkg = @import("../config.zig");
+const termio = @import("../termio.zig");
 const Config = configpkg.Config;
 
 const log = std.log.scoped(.embedded_window);
@@ -86,6 +87,24 @@ pub const App = struct {
 
         /// Close the current surface given by this function.
         close_surface: ?*const fn (SurfaceUD, bool) callconv(.c) void = null,
+
+        /// CNDF external_io: 키 입력 인코딩 결과(UTF-8/escape 시퀀스)를
+        /// 외부 PTY 소유자에게 전달하는 콜백.
+        /// external_io=true 인 surface 에서만 호출된다.
+        /// null 이면 입력 바이트가 조용히 드롭된다.
+        write_input_cb: ?*const fn (
+            SurfaceUD,
+            [*]const u8,
+            usize,
+        ) callconv(.c) void = null,
+
+        /// CNDF external_io: 외부 PTY 소유자에게 resize(cols, rows)를 알리는
+        /// 콜백. external_io=true surface 에서만 호출된다. null 이면 no-op.
+        resize_cb: ?*const fn (
+            SurfaceUD,
+            u16,
+            u16,
+        ) callconv(.c) void = null,
     };
 
     /// This is the key event sent for ghostty_surface_key and
@@ -428,6 +447,10 @@ pub const Surface = struct {
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
 
+    /// CNDF external_io: true 이면 이 surface 는 PTY 없이 동작한다.
+    /// Surface.init opts.external_io 로 설정된다.
+    external_io_enabled: bool = false,
+
     /// Surface initialization options.
     pub const Options = extern struct {
         /// The platform that this surface is being initialized for and
@@ -469,6 +492,10 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
+
+        /// CNDF external_io: true 이면 이 surface 는 PTY를 스폰하지 않는다.
+        /// 외부 워커가 PTY를 소유하며, write_input_cb/resize_cb 로 통신한다.
+        external_io: bool = false,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -483,6 +510,7 @@ pub const Surface = struct {
             },
             .size = .{ .width = 800, .height = 600 },
             .cursor_pos = .{ .x = -1, .y = -1 },
+            .external_io_enabled = opts.external_io,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -994,6 +1022,20 @@ pub const Surface = struct {
         }
 
         return env;
+    }
+
+    /// CNDF external_io: Surface.zig 에서 backend config 를 결정할 때 호출.
+    /// external_io=false 이면 null 반환 → 기존 exec backend 사용.
+    /// external_io=true 이면 ExternalIo.Config 반환 → PTY-less surface.
+    pub fn externalIoConfig(self: *const Surface) ?termio.ExternalIo.Config {
+        log.info("externalIoConfig: external_io_enabled={}", .{self.external_io_enabled});
+        if (!self.external_io_enabled) return null;
+        log.info("externalIoConfig: returning external_io config (PTY-less)", .{});
+        return .{
+            .write_input_cb = self.app.opts.write_input_cb,
+            .resize_cb = self.app.opts.resize_cb,
+            .userdata = self.userdata,
+        };
     }
 
     /// The cursor position from the host directly is in screen coordinates but
