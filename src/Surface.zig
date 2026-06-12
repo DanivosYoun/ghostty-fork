@@ -662,43 +662,58 @@ pub fn init(
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
     {
-        // Exec.init takes ownership of the env even if it fails, so the
-        // errdefer for it must not reach past the call.
-        const env = termio_env: {
-            var env = rt_surface.defaultTermioEnv() catch |err| env: {
-                // If an error occurs, we don't want to block surface startup.
-                log.warn("error getting env map for surface err={}", .{err});
-                break :env global.environMap() catch std.process.Environ.Map.init(alloc);
+        // CNDF external_io: rt_surface 가 external_io config 를 제공하면
+        // PTY-less ExternalIo backend 를 사용하고, 아니면 기존 Exec backend.
+        // external_io 분기에서는 env 를 만들지 않으므로 별도 블록으로 분리.
+        const io_backend: termio.Backend = backend: {
+            if (@hasDecl(apprt.Surface, "externalIoConfig")) {
+                if (rt_surface.externalIoConfig()) |ext_cfg| {
+                    const io_ext = try termio.ExternalIo.init(alloc, ext_cfg);
+                    break :backend .{ .external_io = io_ext };
+                }
+            }
+
+            // Exec.init takes ownership of the env even if it fails, so the
+            // errdefer for it must not reach past the call.
+            const env = termio_env: {
+                var env = rt_surface.defaultTermioEnv() catch |err| env: {
+                    // If an error occurs, we don't want to block surface startup.
+                    log.warn("error getting env map for surface err={}", .{err});
+                    break :env global.environMap() catch std.process.Environ.Map.init(alloc);
+                };
+                errdefer env.deinit();
+
+                // don't leak GHOSTTY_LOG to any subprocesses
+                _ = env.orderedRemove("GHOSTTY_LOG");
+
+                var buf: [18]u8 = undefined;
+                try env.put(
+                    "GHOSTTY_SURFACE_ID",
+                    std.mem.print(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
+                );
+
+                break :termio_env env;
             };
-            errdefer env.deinit();
 
-            // don't leak GHOSTTY_LOG to any subprocesses
-            _ = env.orderedRemove("GHOSTTY_LOG");
-
-            var buf: [18]u8 = undefined;
-            try env.put(
-                "GHOSTTY_SURFACE_ID",
-                std.mem.print(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
-            );
-
-            break :termio_env env;
+            const io_exec = try termio.Exec.init(alloc, .{
+                .command = command,
+                .env = env,
+                .env_override = config.env,
+                .shell_integration = config.@"shell-integration",
+                .shell_integration_features = config.@"shell-integration-features",
+                .cursor_blink = config.@"cursor-style-blink",
+                .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
+                .resources_dir = global.resourcesDir().host(),
+                .term = config.term,
+                .rt_pre_exec_info = .init(config),
+                .rt_post_fork_info = .init(config),
+            });
+            break :backend .{ .exec = io_exec };
         };
-
-        // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
-            .command = command,
-            .env = env,
-            .env_override = config.env,
-            .shell_integration = config.@"shell-integration",
-            .shell_integration_features = config.@"shell-integration-features",
-            .cursor_blink = config.@"cursor-style-blink",
-            .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
-            .resources_dir = global.resourcesDir().host(),
-            .term = config.term,
-            .rt_pre_exec_info = .init(config),
-            .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
+        errdefer switch (io_backend) {
+            .exec => |*exec| @constCast(exec).deinit(),
+            .external_io => |*ext| @constCast(ext).deinit(),
+        };
 
         // Initialize our IO mailbox
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
@@ -712,7 +727,7 @@ pub fn init(
             .size = size,
             .full_config = config,
             .config = io_config,
-            .backend = .{ .exec = io_exec },
+            .backend = io_backend,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
@@ -1386,6 +1401,8 @@ fn childExitedAbnormally(
     // Build up our command for the error message
     const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
         .exec => |*exec| exec.subprocess.args,
+        // external_io: 외부가 프로세스를 소유하므로 args 없음.
+        .external_io => &[_][]const u8{},
     });
     const runtime_str = try alloc.print("{d} ms", .{info.runtime_ms});
 
