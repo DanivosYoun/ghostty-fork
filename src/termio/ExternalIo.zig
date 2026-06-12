@@ -97,9 +97,9 @@ pub fn resize(
     grid_size: renderer.GridSize,
     _: renderer.ScreenSize,
 ) !void {
-    // TODO(P3): resize_cb 를 td 에서 가져오는 것이 맞지만, resize 는
-    // Termio.init 에서 backend.initTerminal 전에도 불릴 수 있으므로
-    // self 에 저장된 콜백을 사용한다.
+    // self 와 td.backend.external_io 는 init/threadEnter 에서 같은 포인터값을
+    // 복사해 보관하므로 둘 중 무엇을 써도 동일하다. resize 는 외부 PTY 소유자에게
+    // 보내는 단방향 알림이라 스레드-로컬 상태가 불필요해 self 를 쓴다.
     if (self.resize_cb) |cb| {
         cb(self.userdata, grid_size.columns, grid_size.rows);
     } else {
