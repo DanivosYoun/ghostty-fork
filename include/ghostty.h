@@ -30,6 +30,8 @@ typedef void* ghostty_app_t;
 typedef void* ghostty_config_t;
 typedef void* ghostty_surface_t;
 typedef void* ghostty_inspector_t;
+// CNDF: immutable terminal text snapshot used by the search bridge.
+typedef void* ghostty_search_document_t;
 
 // All the types below are fully defined and must be kept in sync with
 // their Zig counterparts. Any changes to these types MUST have an associated
@@ -471,6 +473,54 @@ typedef struct {
   uint32_t cell_width_px;
   uint32_t cell_height_px;
 } ghostty_cursor_position_s;
+
+// CNDF search bridge: half-open [start, end) range of UTF-8 byte offsets into
+// a ghostty_search_document_info_s.text snapshot.
+typedef struct {
+  size_t start;
+  size_t end;
+} ghostty_search_range_s;
+
+// CNDF search bridge: rectangle in framebuffer pixels with a top-left origin.
+// Not scaled to points; the caller owns any pixel/scale conversion.
+typedef struct {
+  double x;
+  double y;
+  double width;
+  double height;
+} ghostty_search_rect_s;
+
+// CNDF search bridge: a hyperlink in the snapshot. `range` is a UTF-8 byte
+// range into the document text; `url` is borrowed (not NUL-terminated) and
+// valid until the owning document is freed. A link covers exactly the cells
+// that carry it: a space is part of it only if that space cell carries the
+// link itself. An unlinked gap or a line end ends a link, so two runs of the
+// same URL separated by one are two entries, and a range never contains a
+// newline.
+typedef struct {
+  ghostty_search_range_s range;
+  const char* url;
+  size_t url_len;
+} ghostty_search_link_s;
+
+// CNDF search bridge: description of a captured document. All pointers are
+// borrowed from the document handle and valid until
+// ghostty_search_document_free.
+typedef struct {
+  const char* text;   // UTF-8, not NUL-terminated
+  size_t text_len;    // bytes
+  uint64_t surface_id;
+  uint64_t document_id;
+  uint32_t screen;      // captured screen: 0 = primary, 1 = alternate
+  const ghostty_search_link_s* links;
+  size_t link_count;
+} ghostty_search_document_info_s;
+
+// CNDF search bridge: invoked when the surface's searchable content changes
+// (document_changed == true) or only its viewport moved/refreshed
+// (document_changed == false). Notifications are coalesced. See
+// ghostty_surface_search_set_callback for the threading contract.
+typedef void (*ghostty_search_changed_cb)(void*, bool document_changed);
 
 // Config types
 
@@ -1194,6 +1244,86 @@ bool ghostty_surface_read_text(ghostty_surface_t,
                                ghostty_selection_s,
                                ghostty_text_s*);
 void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
+
+// CNDF search bridge.
+//
+// Captures an immutable snapshot of the surface's searchable text. The
+// snapshot owns independent storage, so it stays valid across later surface
+// mutation and must be released exactly once with
+// ghostty_search_document_free, even after the surface has been freed.
+// Fills `info` and returns the handle, or returns NULL (leaving `info`
+// unspecified) on failure. The memory referenced by `info` is borrowed from
+// the handle and valid only until it is freed.
+ghostty_search_document_t ghostty_surface_search_capture(
+    ghostty_surface_t,
+    ghostty_search_document_info_s*);
+void ghostty_search_document_free(ghostty_search_document_t);
+
+// Projects a document range to framebuffer-pixel rectangles (top-left
+// origin; the caller converts to points/scale). Nothing is clamped.
+//
+// `count` is required and is always written (0 unless stated otherwise):
+//
+//   - true: the projection is valid and `count` rectangles were written.
+//     `count` may be 0: the range is valid but has nothing to draw, either
+//     because it maps to no cell (e.g. only a newline) or because every
+//     cell is outside the viewport.
+//   - false with `count` > 0: the projection is valid but `capacity` is too
+//     small; `count` is the number of rectangles needed, none were written,
+//     and the call may be repeated with a larger buffer.
+//   - false with `count` == 0: nothing was projected and `count` carries no
+//     size. The document is stale (surface content changed since capture),
+//     belongs to another surface, the range is empty, out of range or
+//     starts/ends inside a UTF-8 sequence, or an internal failure occurred.
+//     Callers should re-capture rather than retry unchanged.
+bool ghostty_surface_search_project(ghostty_surface_t,
+                                    ghostty_search_document_t,
+                                    ghostty_search_range_s,
+                                    ghostty_search_rect_s*,
+                                    size_t capacity,
+                                    size_t* count);
+
+// Scrolls the viewport to reveal the first cell of a document range.
+// Rejects (returns false) stale documents, empty/invalid ranges,
+// cross-surface documents, and valid ranges that map to no cell (e.g. only a
+// newline); the range is not clamped.
+bool ghostty_surface_search_reveal(ghostty_surface_t,
+                                   ghostty_search_document_t,
+                                   ghostty_search_range_s);
+
+// Registers (or, with a NULL callback, unregisters) the change callback.
+//
+// Threading contract: the thread that created the app (ghostty_app_new) owns
+// the search callback. Registration, unregistration, surface creation and
+// destruction, and ghostty_app_tick must all happen on that thread; calls to
+// this function from another thread are fatal errors. The callback is invoked
+// from ghostty_app_tick on that thread with coalesced mutation/viewport
+// refresh notifications, at most once per surface per tick, never with a
+// terminal lock held.
+//
+// The callback may unregister itself or destroy its own surface. It must
+// not touch the surface after doing so. Unregistration prevents future
+// delivery; a callback that unregisters itself continues until it returns.
+// Userdata may be freed after unregistering only if the current callback
+// and caller will not access it again. A
+// registration may receive one spurious notification caused by activity
+// that predates it; treat notifications as "re-capture", not as a delta.
+// After unregistering or surface destruction no further callbacks are
+// delivered.
+//
+// Registering or unregistering from another thread, and creating or
+// destroying a surface from another thread, is a fatal error (the process
+// aborts): ignoring it would leave a callback armed against userdata the
+// embedder is about to free.
+//
+// ghostty_surface_search_project and _reveal are owner-thread only (they read
+// surface geometry owned by that thread); from another thread they return
+// false with count 0. ghostty_surface_search_capture may be called from any
+// thread while the surface is alive, and ghostty_search_document_free from
+// any thread, including after the surface was freed.
+void ghostty_surface_search_set_callback(ghostty_surface_t,
+                                         ghostty_search_changed_cb,
+                                         void*);
 
 #ifdef __APPLE__
 void ghostty_surface_set_display_id(ghostty_surface_t, uint32_t);

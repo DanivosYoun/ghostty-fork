@@ -147,8 +147,17 @@ pub fn threadMain(self: *Thread, io: *termio.Termio) void {
         // the error to the surface thread and let the apprt deal with it
         // in some way but this works for now. Without this, the user would
         // just see a blank terminal window.
+        //
+        // CNDF: the error text below rewrites searchable content, so it
+        // is bracketed as a search mutation and reported once the lock is
+        // released (the notify defer is declared first so it runs after
+        // the unlock).
+        defer io.searchNotify(true);
+
         io.renderer_state.mutex.lock();
         defer io.renderer_state.mutex.unlock();
+        io.searchMutationBegin();
+        defer io.searchMutationEnd();
         const t = io.renderer_state.terminal;
 
         // Hide the cursor

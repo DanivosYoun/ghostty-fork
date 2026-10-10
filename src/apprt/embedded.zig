@@ -151,6 +151,12 @@ pub const App = struct {
     /// The configuration for the app. This is owned by this structure.
     config: Config,
 
+    /// CNDF search bridge: the thread that created the app, i.e. the
+    /// embedder's main event thread. Surfaces are created, destroyed and
+    /// ticked there, and the search callbacks are registered, delivered
+    /// and unregistered only there (see ghostty_surface_search_set_callback).
+    owner_thread: std.Thread.Id,
+
     pub fn init(
         self: *App,
         core_app: *CoreApp,
@@ -170,7 +176,13 @@ pub const App = struct {
             .config = config_clone,
             .opts = opts,
             .keymap = keymap,
+            .owner_thread = std.Thread.getCurrentId(),
         };
+    }
+
+    /// True if called on the thread that created the app.
+    fn isOwnerThread(self: *const App) bool {
+        return std.Thread.getCurrentId() == self.owner_thread;
     }
 
     pub fn terminate(self: *App) void {
@@ -263,6 +275,78 @@ pub const App = struct {
 
     pub fn wait(self: *const App) !void {
         _ = self;
+    }
+
+    /// CNDF search bridge: deliver coalesced search notifications to the
+    /// surfaces that registered a callback. Runs on the app's owner thread
+    /// (ghostty_app_tick), never with a renderer mutex held.
+    ///
+    /// Producers (termio, the surface) only set an atomic flag on the
+    /// surface and wake the app; the delivery happens here, so a callback
+    /// can never observe a surface that is being torn down: destroyed
+    /// surfaces are no longer in the app's surface list and their bridge
+    /// state is cleared in Surface.deinit.
+    ///
+    /// Each surface is delivered at most once per call, whatever its
+    /// callback or the IO threads do meanwhile. Callbacks may create or
+    /// destroy surfaces, so no surface pointer or list position is kept
+    /// across a callback. Instead the surface nonces (strictly increasing
+    /// in creation order) drive the scan:
+    ///
+    ///   - `cutoff` is the next nonce at entry. Surfaces created by a
+    ///     callback have a nonce at or above it and wait for the next tick.
+    ///   - `last` is the nonce of the surface delivered most recently,
+    ///     stored BEFORE its callback runs. Every pass picks the lowest
+    ///     pending nonce above it, so a surface that is re-armed during or
+    ///     after its own callback is not delivered again in this call.
+    ///     The producer that re-armed it saw "nothing pending" (the
+    ///     delivery consumed the bits) and has already woken the app, so
+    ///     the next tick delivers it.
+    fn searchDeliver(self: *App) void {
+        // Callbacks are only ever delivered on the owner thread, which is
+        // what makes registration and delivery race free without a lock.
+        // Only complain when something is actually pending (i.e. a search
+        // callback is registered): embedders that never use the search
+        // bridge are not affected by where they tick.
+        const owner = self.isOwnerThread();
+
+        const cutoff = SearchBridge.next_id.load(.acquire);
+        var last: u64 = 0;
+        while (true) {
+            var next: ?*Surface = null;
+            for (self.core_app.surfaces.items) |surface| {
+                const id = surface.search.id;
+                if (id <= last or id >= cutoff) continue;
+                if (surface.search.pending.load(.acquire) == 0) continue;
+                if (next) |n| {
+                    if (n.search.id < id) continue;
+                }
+                next = surface;
+            }
+
+            const surface = next orelse break;
+            if (!owner) {
+                @panic("ghostty_app_tick called off the app owner thread with search notifications pending");
+            }
+            last = surface.search.id;
+
+            // The registration may have been dropped since the scan.
+            const delivery = surface.searchTake() orelse continue;
+
+            // The surface may be destroyed by the callback; do not touch
+            // it afterwards.
+            delivery.callback(delivery.userdata, delivery.document);
+        }
+
+        // Surfaces created by a callback are skipped above. Their
+        // producers woke the app when they armed them, but make sure a
+        // notification can't be stranded behind this tick.
+        for (self.core_app.surfaces.items) |surface| {
+            if (surface.search.id < cutoff) continue;
+            if (surface.search.pending.load(.acquire) == 0) continue;
+            self.wakeup();
+            break;
+        }
     }
 
     /// Create a new surface for the app.
@@ -433,6 +517,43 @@ pub const EnvVar = extern struct {
     value: [*:0]const u8,
 };
 
+/// CNDF search bridge: per-surface notification state.
+///
+/// Producer threads (termio, surface) only touch the two atomics. The
+/// callback registration belongs to the app's owner thread.
+const SearchBridge = struct {
+    const Callback = *const fn (?*anyopaque, bool) callconv(.c) void;
+
+    /// Bits of `pending`.
+    const pending_viewport: u8 = 1 << 0;
+    const pending_document: u8 = 1 << 1;
+
+    /// A nonce unique to this surface within the process. Unlike the
+    /// surface address it is never reused, so a document captured from a
+    /// destroyed surface is rejected even if a new surface is allocated
+    /// at the same address. 0 means "not assigned".
+    id: u64 = 0,
+
+    /// The registration. Only touched on the app's owner thread (set,
+    /// unregister, deliver, surface teardown), so it needs no lock and a
+    /// callback can never race its own unregistration.
+    callback: ?Callback = null,
+    userdata: ?*anyopaque = null,
+
+    /// True while a callback is registered. Fast path for producers.
+    enabled: std.atomic.Value(bool) = .init(false),
+
+    /// Coalesced, not yet delivered notifications.
+    pending: std.atomic.Value(u8) = .init(0),
+
+    /// Source of surface nonces and document ids. 0 is never handed out.
+    var next_id: std.atomic.Value(u64) = .init(1);
+
+    fn nextId() u64 {
+        return next_id.fetchAdd(1, .monotonic);
+    }
+};
+
 pub const Surface = struct {
     app: *App,
     platform: Platform,
@@ -450,6 +571,9 @@ pub const Surface = struct {
     /// CNDF external_io: true 이면 이 surface 는 PTY 없이 동작한다.
     /// Surface.init opts.external_io 로 설정된다.
     external_io_enabled: bool = false,
+
+    /// CNDF search bridge state (callback registration, coalescing, id).
+    search: SearchBridge = .{},
 
     /// Surface initialization options.
     pub const Options = extern struct {
@@ -499,6 +623,14 @@ pub const Surface = struct {
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
+        // CNDF: surfaces are created and destroyed on the thread that
+        // owns the app, the same thread the search callbacks run on. That
+        // is what makes callback registration and teardown race free
+        // without locking, so a violation must not be silently tolerated.
+        if (!app.isOwnerThread()) {
+            @panic("ghostty surface created off the app owner thread");
+        }
+
         self.* = .{
             .app = app,
             .platform = try .init(opts.platform_tag, opts.platform),
@@ -512,6 +644,7 @@ pub const Surface = struct {
             .cursor_pos = .{ .x = -1, .y = -1 },
             .external_io_enabled = opts.external_io,
         };
+        self.search.id = SearchBridge.nextId();
 
         // Add ourselves to the list of surfaces on the app.
         try app.core_app.addSurface(self);
@@ -630,6 +763,18 @@ pub const Surface = struct {
     }
 
     pub fn deinit(self: *Surface) void {
+        // CNDF: stop search notifications before anything else is torn
+        // down. The IO thread may still be running until core_surface is
+        // deinitialized; it only reaches searchNotify, which is a no-op
+        // once disabled. Surfaces are destroyed on the owner thread, the
+        // same thread callbacks run on, so none can be in flight. Freeing
+        // the surface (and so the embedder's userdata) from another thread
+        // could race a callback: fail loudly instead.
+        if (!self.app.isOwnerThread()) {
+            @panic("ghostty surface destroyed off the app owner thread");
+        }
+        self.searchReset();
+
         // Shut down our inspector
         self.freeInspector();
 
@@ -688,6 +833,87 @@ pub const Surface = struct {
         const func = self.app.opts.read_pty orelse return;
         if (buf.len == 0) return;
         func(self.userdata, buf.ptr, buf.len);
+    }
+
+    /// CNDF search bridge: record that searchable content (`document`) or
+    /// only the viewport changed. Safe to call from any thread, with or
+    /// without the renderer mutex; it never blocks and never calls into the
+    /// embedder except for the app wakeup. The notification is delivered on
+    /// the main event thread by App.searchDeliver, coalesced.
+    pub fn searchNotify(self: *Surface, document: bool) void {
+        if (!self.search.enabled.load(.acquire)) return;
+
+        const bit = if (document)
+            SearchBridge.pending_document
+        else
+            SearchBridge.pending_viewport;
+
+        // Only the transition from "nothing pending" needs a wakeup; any
+        // other state means a delivery is already scheduled.
+        const prev = self.search.pending.fetchOr(bit, .acq_rel);
+        if (prev == 0) self.app.wakeup();
+    }
+
+    const SearchDelivery = struct {
+        callback: SearchBridge.Callback,
+        userdata: ?*anyopaque,
+        document: bool,
+    };
+
+    /// CNDF search bridge: consume the pending notification, if any and if
+    /// a callback is still registered. Owner thread only.
+    fn searchTake(self: *Surface) ?SearchDelivery {
+        if (self.search.pending.load(.acquire) == 0) return null;
+
+        const bits = self.search.pending.swap(0, .acq_rel);
+        if (bits == 0) return null;
+        const callback = self.search.callback orelse return null;
+        return .{
+            .callback = callback,
+            .userdata = self.search.userdata,
+            .document = bits & SearchBridge.pending_document != 0,
+        };
+    }
+
+    /// CNDF search bridge: drop the registration and anything not yet
+    /// delivered. Owner thread only.
+    fn searchReset(self: *Surface) void {
+        self.search.enabled.store(false, .release);
+        self.search.pending.store(0, .release);
+        self.search.callback = null;
+        self.search.userdata = null;
+    }
+
+    /// CNDF search bridge: register or (null) unregister the change
+    /// callback. Anything not yet delivered is dropped on either change.
+    ///
+    /// Owner thread only: delivery runs on the same thread from
+    /// ghostty_app_tick, so a registration change can never overlap a
+    /// callback invocation or free its userdata under it. A call from
+    /// another thread panics: ignoring an unregister would leave a
+    /// callback armed whose userdata the embedder is about to free.
+    ///
+    /// A producer thread that loaded `enabled` just before this call can
+    /// still arm `pending` right after it was cleared, so a new
+    /// registration may receive one notification that was triggered
+    /// before it. That is a harmless spurious refresh (the embedder
+    /// re-captures); it never reaches an unregistered callback, because
+    /// delivery re-checks the registration.
+    fn searchSetCallback(
+        self: *Surface,
+        callback: ?SearchBridge.Callback,
+        userdata: ?*anyopaque,
+    ) void {
+        if (!self.app.isOwnerThread()) {
+            @panic("ghostty_surface_search_set_callback called off the app owner thread");
+        }
+
+        self.searchReset();
+        if (callback) |cb| {
+            self.search.callback = cb;
+            self.search.userdata = userdata;
+            self.search.enabled.store(true, .release);
+        }
     }
 
     pub fn getContentScale(self: *const Surface) !apprt.ContentScale {
@@ -1143,6 +1369,11 @@ pub const Inspector = struct {
                 const surface = &self.surface.core_surface;
                 const inspector = surface.inspector orelse break :render;
                 inspector.render(surface);
+
+                // CNDF: the inspector's page list can scroll the viewport.
+                // It is rebuilt every render, so a refresh notification
+                // per render while it is open is no extra work.
+                self.surface.searchNotify(false);
             }
 
             // Render
@@ -1491,6 +1722,9 @@ pub const CAPI = struct {
         v.core_app.tick(v) catch |err| {
             log.err("error app tick err={}", .{err});
         };
+
+        // CNDF: deliver coalesced search bridge notifications.
+        v.searchDeliver();
     }
 
     /// Return the userdata associated with the app.
@@ -1742,6 +1976,327 @@ pub const CAPI = struct {
 
     export fn ghostty_surface_free_text(ptr: *Text) void {
         ptr.deinit();
+    }
+
+    /// CNDF search bridge: register (or, with a null callback, unregister)
+    /// the change callback. Owner thread only (the thread that created the
+    /// app); the callback runs on that thread from ghostty_app_tick, with
+    /// coalesced notifications.
+    export fn ghostty_surface_search_set_callback(
+        surface: *Surface,
+        callback: ?*const fn (?*anyopaque, bool) callconv(.c) void,
+        userdata: ?*anyopaque,
+    ) void {
+        surface.searchSetCallback(callback, userdata);
+    }
+
+    // ghostty_search_range_s
+    const SearchRange = extern struct {
+        start: usize,
+        end: usize,
+    };
+
+    // ghostty_search_rect_s
+    const SearchRect = CoreSurface.SearchRect;
+
+    // ghostty_search_link_s
+    const SearchLink = extern struct {
+        range: SearchRange,
+        url: ?[*]const u8,
+        url_len: usize,
+    };
+
+    // ghostty_search_document_info_s
+    const SearchDocumentInfo = extern struct {
+        text: ?[*]const u8,
+        text_len: usize,
+        surface_id: u64,
+        document_id: u64,
+        screen: u32,
+        links: ?[*]const SearchLink,
+        link_count: usize,
+    };
+
+    /// ghostty_search_document_t. Owns all of its memory (the document
+    /// text/rows/links and the C link table) with the global allocator, so
+    /// it is independent of the surface and of the terminal. The row Pins
+    /// inside `doc` are untracked and must only be dereferenced after
+    /// searchDocumentLive.
+    const SearchHandle = struct {
+        doc: terminal.SearchDocument,
+        links: []SearchLink,
+
+        /// The nonce of the surface this was captured from.
+        surface_id: u64,
+        document_id: u64,
+
+        /// The screen that was captured, by key and by identity.
+        screen_key: terminal.ScreenSet.Key,
+        screen: *const terminal.Screen,
+
+        fn destroy(self: *SearchHandle) void {
+            const alloc = global.alloc;
+            alloc.free(self.links);
+            self.doc.deinit();
+            alloc.destroy(self);
+        }
+    };
+
+    /// Captures the retained text of the active screen. Holds the renderer
+    /// mutex for the duration of the capture.
+    fn searchCapture(
+        surface: *Surface,
+        info: *SearchDocumentInfo,
+    ) !*SearchHandle {
+        const core = &surface.core_surface;
+        const alloc = global.alloc;
+
+        core.renderer_state.mutex.lock();
+        defer core.renderer_state.mutex.unlock();
+
+        // A mutation is in flight (the stream handler dropped the mutex
+        // mid-parse); there is no consistent state to capture. The mutation
+        // end notifies the embedder, which can capture again.
+        const epoch = core.io.searchEpoch() orelse return error.Mutating;
+        const screens = &core.renderer_state.terminal.screens;
+
+        const handle = try alloc.create(SearchHandle);
+        errdefer alloc.destroy(handle);
+
+        var doc = try terminal.SearchDocument.capture(
+            alloc,
+            screens.active,
+            epoch,
+        );
+        errdefer doc.deinit();
+
+        const links = try alloc.alloc(SearchLink, doc.links.len);
+        errdefer alloc.free(links);
+        for (doc.links, links) |src, *dst| dst.* = .{
+            .range = .{ .start = src.start, .end = src.end },
+            .url = if (src.uri.len > 0) src.uri.ptr else null,
+            .url_len = src.uri.len,
+        };
+
+        handle.* = .{
+            .doc = doc,
+            .links = links,
+            .surface_id = surface.search.id,
+            .document_id = SearchBridge.nextId(),
+            .screen_key = screens.active_key,
+            .screen = screens.active,
+        };
+
+        info.* = .{
+            .text = doc.text.ptr,
+            .text_len = doc.text.len,
+            .surface_id = handle.surface_id,
+            .document_id = handle.document_id,
+            .screen = @intFromEnum(handle.screen_key),
+            .links = if (links.len > 0) links.ptr else null,
+            .link_count = links.len,
+        };
+
+        return handle;
+    }
+
+    /// True if the document was captured from this surface and the
+    /// terminal has not been mutated or switched screens since. Only then
+    /// may the document's row Pins be dereferenced.
+    ///
+    /// The nonce comparison rejects documents from other surfaces,
+    /// including a surface that was allocated at a reused address. The
+    /// epoch comparison rejects any VT output, resize/reflow, clear or
+    /// reset since the capture (and any in-flight mutation).
+    ///
+    /// Precondition: the renderer state mutex must be held.
+    fn searchDocumentLive(surface: *Surface, handle: *const SearchHandle) bool {
+        if (handle.surface_id == 0) return false;
+        if (handle.surface_id != surface.search.id) return false;
+
+        const core = &surface.core_surface;
+        const epoch = core.io.searchEpoch() orelse return false;
+        if (epoch != handle.doc.epoch) return false;
+
+        const screens = &core.renderer_state.terminal.screens;
+        if (screens.active_key != handle.screen_key) return false;
+        if (screens.active != handle.screen) return false;
+        return true;
+    }
+
+    /// A range is valid if it is non-empty, inside the text, and starts
+    /// and ends on UTF-8 code point boundaries. The text is always valid
+    /// UTF-8, so a continuation byte at either edge means a split rune.
+    /// The range is never clamped.
+    fn searchRangeValid(text: []const u8, range: SearchRange) bool {
+        if (range.start >= range.end) return false;
+        if (range.end > text.len) return false;
+        if ((text[range.start] & 0xC0) == 0x80) return false;
+        if (range.end < text.len and (text[range.end] & 0xC0) == 0x80) {
+            return false;
+        }
+        return true;
+    }
+
+    fn searchProject(
+        surface: *Surface,
+        handle: *const SearchHandle,
+        range: SearchRange,
+        out: ?[*]SearchRect,
+        capacity: usize,
+        count: *usize,
+    ) !bool {
+        if (!searchRangeValid(handle.doc.text, range)) return false;
+
+        const core = &surface.core_surface;
+        const alloc = global.alloc;
+
+        core.renderer_state.mutex.lock();
+        defer core.renderer_state.mutex.unlock();
+
+        // Everything below dereferences Pins; validate first.
+        if (!searchDocumentLive(surface, handle)) return false;
+
+        var cells: std.ArrayList(terminal.Pin) = .empty;
+        defer cells.deinit(alloc);
+        try handle.doc.cellsForRange(
+            alloc,
+            .{ .start = range.start, .end = range.end },
+            std.math.maxInt(usize),
+            &cells,
+        );
+
+        // A valid range that maps to no cell (e.g. only a newline) has
+        // nothing to draw: a live document, zero rectangles. This is not
+        // a stale-document failure, so it must not look like one to the
+        // embedder (which would re-capture and ask again).
+        if (cells.items.len == 0) return true;
+
+        // From here the projection is valid. Only a valid projection
+        // reports a count: on any failure above and below `count` stays 0.
+        const needed = try core.searchProjectLocked(alloc, cells.items, null);
+        if (needed > capacity) {
+            // Valid, but the caller's buffer is too small: report the
+            // size to retry with and write nothing.
+            count.* = needed;
+            return false;
+        }
+        if (needed == 0) return true;
+
+        const buf = out orelse return false;
+        const written = try core.searchProjectLocked(
+            alloc,
+            cells.items,
+            buf[0..needed],
+        );
+        assert(written == needed);
+        count.* = needed;
+        return true;
+    }
+
+    /// Precondition: the renderer state mutex must be held.
+    fn searchRevealLocked(
+        surface: *Surface,
+        handle: *const SearchHandle,
+        range: SearchRange,
+    ) !bool {
+        if (!searchRangeValid(handle.doc.text, range)) return false;
+        if (!searchDocumentLive(surface, handle)) return false;
+
+        const alloc = global.alloc;
+        var cells: std.ArrayList(terminal.Pin) = .empty;
+        defer cells.deinit(alloc);
+        try handle.doc.cellsForRange(
+            alloc,
+            .{ .start = range.start, .end = range.end },
+            1,
+            &cells,
+        );
+        if (cells.items.len == 0) return false;
+
+        try surface.core_surface.searchRevealLocked(alloc, cells.items[0]);
+        return true;
+    }
+
+    /// Captures an immutable snapshot of the surface's searchable text.
+    /// Returns null on failure (including while the terminal is being
+    /// mutated). Free with ghostty_search_document_free.
+    export fn ghostty_surface_search_capture(
+        surface: *Surface,
+        info: ?*SearchDocumentInfo,
+    ) ?*SearchHandle {
+        const out = info orelse return null;
+        return searchCapture(surface, out) catch |err| {
+            log.warn("error capturing search document err={}", .{err});
+            return null;
+        };
+    }
+
+    /// Frees a document. Valid after the surface it came from was freed.
+    export fn ghostty_search_document_free(handle: ?*SearchHandle) void {
+        if (handle) |h| h.destroy();
+    }
+
+    /// Projects a document byte range to framebuffer-pixel rectangles.
+    export fn ghostty_surface_search_project(
+        surface: *Surface,
+        handle: ?*SearchHandle,
+        range: SearchRange,
+        out: ?[*]SearchRect,
+        capacity: usize,
+        count: ?*usize,
+    ) bool {
+        const count_ptr = count orelse return false;
+        count_ptr.* = 0;
+
+        // Geometry (Surface.size) is owned by the owner thread and not
+        // protected by the renderer mutex.
+        if (!surface.app.isOwnerThread()) {
+            log.err("ghostty_surface_search_project called off the app owner thread", .{});
+            return false;
+        }
+
+        const h = handle orelse return false;
+        return searchProject(
+            surface,
+            h,
+            range,
+            out,
+            capacity,
+            count_ptr,
+        ) catch |err| {
+            log.warn("error projecting search range err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Scrolls the viewport to reveal the first cell of a document range.
+    export fn ghostty_surface_search_reveal(
+        surface: *Surface,
+        handle: ?*SearchHandle,
+        range: SearchRange,
+    ) bool {
+        if (!surface.app.isOwnerThread()) {
+            log.err("ghostty_surface_search_reveal called off the app owner thread", .{});
+            return false;
+        }
+
+        const h = handle orelse return false;
+        const core = &surface.core_surface;
+
+        // The viewport may move: report it once the lock is released
+        // (declared first so it runs after the unlock).
+        var revealed = false;
+        defer if (revealed) core.io.searchNotify(false);
+
+        core.renderer_state.mutex.lock();
+        defer core.renderer_state.mutex.unlock();
+
+        revealed = searchRevealLocked(surface, h, range) catch |err| {
+            log.warn("error revealing search range err={}", .{err});
+            return false;
+        };
+        return revealed;
     }
 
     /// Tell the surface that it needs to schedule a render
