@@ -1111,6 +1111,10 @@ palette: Palette = .{},
 ///
 /// The default value is black text on a golden yellow background.
 @"search-foreground": TerminalColor = .{ .color = .{ .r = 0, .g = 0, .b = 0 } },
+/// Background and foreground for OSC 8 matches in embedded search results.
+@"search-link-background": TerminalColor = .{ .color = .{ .r = 0x3B, .g = 0x82, .b = 0xF6 } },
+@"search-link-foreground": TerminalColor = .{ .color = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF } },
+
 @"search-background": TerminalColor = .{ .color = .{ .r = 0xFF, .g = 0xE0, .b = 0x82 } },
 
 /// The foreground and background color for the currently selected search match.

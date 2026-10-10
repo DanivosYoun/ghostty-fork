@@ -61,6 +61,9 @@ pub const Message = union(enum) {
     /// no match currently.
     search_selected_match: ?SearchMatch,
 
+    /// Immutable embedded-search anchors; a message owns one reference.
+    search_results: struct { set: ?*terminal.SearchResults, selected: ?usize },
+
     /// Activate or deactivate the inspector.
     inspector: bool,
 
@@ -105,6 +108,7 @@ pub const Message = union(enum) {
                 v.alloc.destroy(v.thread);
             },
 
+            .search_results => |v| if (v.set) |set| set.release(),
             else => {},
         }
     }

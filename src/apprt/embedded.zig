@@ -525,7 +525,6 @@ const SearchBridge = struct {
     const Callback = *const fn (?*anyopaque, bool) callconv(.c) void;
 
     /// Bits of `pending`.
-    const pending_viewport: u8 = 1 << 0;
     const pending_document: u8 = 1 << 1;
 
     /// A nonce unique to this surface within the process. Unlike the
@@ -533,6 +532,8 @@ const SearchBridge = struct {
     /// destroyed surface is rejected even if a new surface is allocated
     /// at the same address. 0 means "not assigned".
     id: u64 = 0,
+    results: ?*terminal.SearchResults = null,
+    selected: ?usize = null,
 
     /// The registration. Only touched on the app's owner thread (set,
     /// unregister, deliver, surface teardown), so it needs no lock and a
@@ -774,6 +775,8 @@ pub const Surface = struct {
             @panic("ghostty surface destroyed off the app owner thread");
         }
         self.searchReset();
+        if (self.search.results) |set| set.release();
+        self.search.results = null;
 
         // Shut down our inspector
         self.freeInspector();
@@ -835,18 +838,15 @@ pub const Surface = struct {
         func(self.userdata, buf.ptr, buf.len);
     }
 
-    /// CNDF search bridge: record that searchable content (`document`) or
-    /// only the viewport changed. Safe to call from any thread, with or
+    /// Record a document mutation (the bool is always true). Safe to call from any thread, with or
     /// without the renderer mutex; it never blocks and never calls into the
     /// embedder except for the app wakeup. The notification is delivered on
     /// the main event thread by App.searchDeliver, coalesced.
     pub fn searchNotify(self: *Surface, document: bool) void {
         if (!self.search.enabled.load(.acquire)) return;
 
-        const bit = if (document)
-            SearchBridge.pending_document
-        else
-            SearchBridge.pending_viewport;
+        assert(document);
+        const bit = SearchBridge.pending_document;
 
         // Only the transition from "nothing pending" needs a wakeup; any
         // other state means a delivery is already scheduled.
@@ -871,7 +871,7 @@ pub const Surface = struct {
         return .{
             .callback = callback,
             .userdata = self.search.userdata,
-            .document = bits & SearchBridge.pending_document != 0,
+            .document = true,
         };
     }
 
@@ -1369,11 +1369,6 @@ pub const Inspector = struct {
                 const surface = &self.surface.core_surface;
                 const inspector = surface.inspector orelse break :render;
                 inspector.render(surface);
-
-                // CNDF: the inspector's page list can scroll the viewport.
-                // It is rebuilt every render, so a refresh notification
-                // per render while it is open is no extra work.
-                self.surface.searchNotify(false);
             }
 
             // Render
@@ -1996,9 +1991,6 @@ pub const CAPI = struct {
         end: usize,
     };
 
-    // ghostty_search_rect_s
-    const SearchRect = CoreSurface.SearchRect;
-
     // ghostty_search_link_s
     const SearchLink = extern struct {
         range: SearchRange,
@@ -2020,8 +2012,7 @@ pub const CAPI = struct {
     /// ghostty_search_document_t. Owns all of its memory (the document
     /// text/rows/links and the C link table) with the global allocator, so
     /// it is independent of the surface and of the terminal. The row Pins
-    /// inside `doc` are untracked and must only be dereferenced after
-    /// searchDocumentLive.
+    /// inside `doc` are untracked and comparison-only after capture.
     const SearchHandle = struct {
         doc: terminal.SearchDocument,
         links: []SearchLink,
@@ -2030,9 +2021,8 @@ pub const CAPI = struct {
         surface_id: u64,
         document_id: u64,
 
-        /// The screen that was captured, by key and by identity.
+        /// Active screen key captured under lock.
         screen_key: terminal.ScreenSet.Key,
-        screen: *const terminal.Screen,
 
         fn destroy(self: *SearchHandle) void {
             const alloc = global.alloc;
@@ -2057,7 +2047,7 @@ pub const CAPI = struct {
         // A mutation is in flight (the stream handler dropped the mutex
         // mid-parse); there is no consistent state to capture. The mutation
         // end notifies the embedder, which can capture again.
-        const epoch = core.io.searchEpoch() orelse return error.Mutating;
+        if (!core.io.searchCaptureReady()) return error.Mutating;
         const screens = &core.renderer_state.terminal.screens;
 
         const handle = try alloc.create(SearchHandle);
@@ -2066,7 +2056,6 @@ pub const CAPI = struct {
         var doc = try terminal.SearchDocument.capture(
             alloc,
             screens.active,
-            epoch,
         );
         errdefer doc.deinit();
 
@@ -2084,7 +2073,6 @@ pub const CAPI = struct {
             .surface_id = surface.search.id,
             .document_id = SearchBridge.nextId(),
             .screen_key = screens.active_key,
-            .screen = screens.active,
         };
 
         info.* = .{
@@ -2098,124 +2086,6 @@ pub const CAPI = struct {
         };
 
         return handle;
-    }
-
-    /// True if the document was captured from this surface and the
-    /// terminal has not been mutated or switched screens since. Only then
-    /// may the document's row Pins be dereferenced.
-    ///
-    /// The nonce comparison rejects documents from other surfaces,
-    /// including a surface that was allocated at a reused address. The
-    /// epoch comparison rejects any VT output, resize/reflow, clear or
-    /// reset since the capture (and any in-flight mutation).
-    ///
-    /// Precondition: the renderer state mutex must be held.
-    fn searchDocumentLive(surface: *Surface, handle: *const SearchHandle) bool {
-        if (handle.surface_id == 0) return false;
-        if (handle.surface_id != surface.search.id) return false;
-
-        const core = &surface.core_surface;
-        const epoch = core.io.searchEpoch() orelse return false;
-        if (epoch != handle.doc.epoch) return false;
-
-        const screens = &core.renderer_state.terminal.screens;
-        if (screens.active_key != handle.screen_key) return false;
-        if (screens.active != handle.screen) return false;
-        return true;
-    }
-
-    /// A range is valid if it is non-empty, inside the text, and starts
-    /// and ends on UTF-8 code point boundaries. The text is always valid
-    /// UTF-8, so a continuation byte at either edge means a split rune.
-    /// The range is never clamped.
-    fn searchRangeValid(text: []const u8, range: SearchRange) bool {
-        if (range.start >= range.end) return false;
-        if (range.end > text.len) return false;
-        if ((text[range.start] & 0xC0) == 0x80) return false;
-        if (range.end < text.len and (text[range.end] & 0xC0) == 0x80) {
-            return false;
-        }
-        return true;
-    }
-
-    fn searchProject(
-        surface: *Surface,
-        handle: *const SearchHandle,
-        range: SearchRange,
-        out: ?[*]SearchRect,
-        capacity: usize,
-        count: *usize,
-    ) !bool {
-        if (!searchRangeValid(handle.doc.text, range)) return false;
-
-        const core = &surface.core_surface;
-        const alloc = global.alloc;
-
-        core.renderer_state.mutex.lock();
-        defer core.renderer_state.mutex.unlock();
-
-        // Everything below dereferences Pins; validate first.
-        if (!searchDocumentLive(surface, handle)) return false;
-
-        var cells: std.ArrayList(terminal.Pin) = .empty;
-        defer cells.deinit(alloc);
-        try handle.doc.cellsForRange(
-            alloc,
-            .{ .start = range.start, .end = range.end },
-            std.math.maxInt(usize),
-            &cells,
-        );
-
-        // A valid range that maps to no cell (e.g. only a newline) has
-        // nothing to draw: a live document, zero rectangles. This is not
-        // a stale-document failure, so it must not look like one to the
-        // embedder (which would re-capture and ask again).
-        if (cells.items.len == 0) return true;
-
-        // From here the projection is valid. Only a valid projection
-        // reports a count: on any failure above and below `count` stays 0.
-        const needed = try core.searchProjectLocked(alloc, cells.items, null);
-        if (needed > capacity) {
-            // Valid, but the caller's buffer is too small: report the
-            // size to retry with and write nothing.
-            count.* = needed;
-            return false;
-        }
-        if (needed == 0) return true;
-
-        const buf = out orelse return false;
-        const written = try core.searchProjectLocked(
-            alloc,
-            cells.items,
-            buf[0..needed],
-        );
-        assert(written == needed);
-        count.* = needed;
-        return true;
-    }
-
-    /// Precondition: the renderer state mutex must be held.
-    fn searchRevealLocked(
-        surface: *Surface,
-        handle: *const SearchHandle,
-        range: SearchRange,
-    ) !bool {
-        if (!searchRangeValid(handle.doc.text, range)) return false;
-        if (!searchDocumentLive(surface, handle)) return false;
-
-        const alloc = global.alloc;
-        var cells: std.ArrayList(terminal.Pin) = .empty;
-        defer cells.deinit(alloc);
-        try handle.doc.cellsForRange(
-            alloc,
-            .{ .start = range.start, .end = range.end },
-            1,
-            &cells,
-        );
-        if (cells.items.len == 0) return false;
-
-        try surface.core_surface.searchRevealLocked(alloc, cells.items[0]);
-        return true;
     }
 
     /// Captures an immutable snapshot of the surface's searchable text.
@@ -2237,66 +2107,131 @@ pub const CAPI = struct {
         if (handle) |h| h.destroy();
     }
 
-    /// Projects a document byte range to framebuffer-pixel rectangles.
-    export fn ghostty_surface_search_project(
-        surface: *Surface,
-        handle: ?*SearchHandle,
-        range: SearchRange,
-        out: ?[*]SearchRect,
-        capacity: usize,
-        count: ?*usize,
-    ) bool {
-        const count_ptr = count orelse return false;
-        count_ptr.* = 0;
-
-        // Geometry (Surface.size) is owned by the owner thread and not
-        // protected by the renderer mutex.
-        if (!surface.app.isOwnerThread()) {
-            log.err("ghostty_surface_search_project called off the app owner thread", .{});
-            return false;
-        }
-
-        const h = handle orelse return false;
-        return searchProject(
-            surface,
-            h,
-            range,
-            out,
-            capacity,
-            count_ptr,
-        ) catch |err| {
-            log.warn("error projecting search range err={}", .{err});
-            return false;
+    /// Transfer a retained immutable set to the renderer outside its lock.
+    fn searchSend(surface: *Surface) void {
+        const core = &surface.core_surface;
+        _ = core.renderer_thread.mailbox.push(.{ .search_results = .{
+            .set = if (surface.search.results) |set| set.retain() else null,
+            .selected = surface.search.selected,
+        } }, .forever);
+        core.renderer_thread.wakeup.notify() catch |err| {
+            log.warn("error waking search renderer err={}", .{err});
         };
     }
 
-    /// Scrolls the viewport to reveal the first cell of a document range.
-    export fn ghostty_surface_search_reveal(
+    export fn ghostty_surface_search_set_results(
         surface: *Surface,
-        handle: ?*SearchHandle,
-        range: SearchRange,
-    ) bool {
-        if (!surface.app.isOwnerThread()) {
-            log.err("ghostty_surface_search_reveal called off the app owner thread", .{});
-            return false;
-        }
-
-        const h = handle orelse return false;
-        const core = &surface.core_surface;
-
-        // The viewport may move: report it once the lock is released
-        // (declared first so it runs after the unlock).
-        var revealed = false;
-        defer if (revealed) core.io.searchNotify(false);
-
-        core.renderer_state.mutex.lock();
-        defer core.renderer_state.mutex.unlock();
-
-        revealed = searchRevealLocked(surface, h, range) catch |err| {
-            log.warn("error revealing search range err={}", .{err});
-            return false;
+        handle: ?*const SearchHandle,
+        ranges: ?[*]const SearchRange,
+        n: usize,
+        keep_selection: bool,
+        out_set_id: ?*u64,
+    ) i64 {
+        if (!surface.app.isOwnerThread()) return -2;
+        const h = handle orelse return -2;
+        if (h.surface_id != surface.search.id or (n > 0 and ranges == null)) return -2;
+        const out = out_set_id orelse return -2;
+        // ABI ranges and document ranges have the same layout.
+        const search_ranges: []const terminal.SearchDocument.Range = if (n == 0) &.{} else @as([*]const terminal.SearchDocument.Range, @ptrCast(ranges.?))[0..n];
+        const set = terminal.SearchResults.create(global.alloc, SearchBridge.nextId(), h.screen_key, &h.doc, search_ranges) catch |err| {
+            log.warn("error committing search results err={}", .{err});
+            return -2;
         };
-        return revealed;
+        var selected: ?usize = null;
+        if (keep_selection) {
+            if (surface.search.results) |previous| {
+                if (surface.search.selected) |index| selected = set.inheritedSelection(previous, index);
+            }
+        }
+        if (surface.search.results) |previous| previous.release();
+        surface.search.results = set;
+        surface.search.selected = selected;
+        out.* = set.id;
+        searchSend(surface);
+        return if (selected) |index| @intCast(index) else -1;
+    }
+
+    fn searchSelectLocked(surface: *Surface, set: *const terminal.SearchResults, index: usize, reveal: bool) bool {
+        const screens = &surface.core_surface.io.terminal.screens;
+        if (screens.active_key != set.screen) return false;
+        const anchors = set.match(index);
+        if (anchors.len == 0) return false;
+        var first: ?terminal.Pin = null;
+        for (anchors) |anchor| {
+            var it = screens.active.pages.pages.first;
+            while (it) |node| : (it = node.next) {
+                // Only a LIVE list node is ever dereferenced.
+                if (@intFromPtr(node) != anchor.key.node or node.serial != anchor.key.serial) continue;
+                if (anchor.key.y >= node.data.size.rows) return false;
+                const row = node.data.getRow(@intCast(anchor.key.y));
+                const view: terminal.SearchDocument.LiveView = .{
+                    .page = &node.data,
+                    .cells = node.data.getCells(row),
+                };
+                const hash = terminal.SearchDocument.rowHash(terminal.SearchDocument.LiveView, view, row.wrap);
+                const cols = terminal.SearchResults.validatedColumns(terminal.SearchDocument.LiveView, view, row.wrap, hash, anchor) orelse return false;
+                if (first == null) first = .{ .node = node, .y = @intCast(anchor.key.y), .x = @intCast(cols[0]) };
+                break;
+            } else return false;
+        }
+        if (reveal) surface.core_surface.searchRevealLocked(first.?) catch return false;
+        return true;
+    }
+
+    export fn ghostty_surface_search_select(surface: *Surface, set_id: u64, index: usize, reveal: bool) bool {
+        if (!surface.app.isOwnerThread()) return false;
+        const set = surface.search.results orelse return false;
+        if (set.id != set_id or index >= set.count()) return false;
+        const mutex = surface.core_surface.renderer_state.mutex;
+        mutex.lock();
+        const valid = searchSelectLocked(surface, set, index, reveal);
+        mutex.unlock();
+        if (!valid) return false;
+        surface.search.selected = index;
+        searchSend(surface);
+        return true;
+    }
+
+    export fn ghostty_surface_search_clear_results(surface: *Surface) void {
+        if (!surface.app.isOwnerThread()) @panic("search clear off owner thread");
+        if (surface.search.results) |set| set.release();
+        surface.search.results = null;
+        surface.search.selected = null;
+        searchSend(surface);
+    }
+
+    /// Diagnostics use the SAME row validator and walker as renderer frames.
+    /// They read live rows under lock without consuming terminal dirty flags.
+    export fn ghostty_surface_search_visible(surface: *Surface, set_id: u64, out: ?[*]terminal.SearchResults.Visible, capacity: usize, count: ?*usize) bool {
+        const count_ptr = count orelse return false;
+        count_ptr.* = 0;
+        if (!surface.app.isOwnerThread()) return false;
+        const set = surface.search.results orelse return true;
+        if (set.id != set_id) return false;
+        const mutex = surface.core_surface.renderer_state.mutex;
+        mutex.lock();
+        defer mutex.unlock();
+        const screens = &surface.core_surface.io.terminal.screens;
+        if (screens.active_key != set.screen) return true;
+        var row_index: u32 = 0;
+        var it = screens.active.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
+        while (it.next()) |pin| : (row_index += 1) {
+            const candidates = set.rows.get(.{ .node = @intFromPtr(pin.node), .serial = pin.node.serial, .y = pin.y }) orelse continue;
+            const page = &pin.node.data;
+            const row = page.getRow(pin.y);
+            const view: terminal.SearchDocument.LiveView = .{ .page = page, .cells = page.getCells(row) };
+            const columns = set.validateRow(terminal.SearchDocument.LiveView, view, row.wrap, candidates, global.alloc) catch return false;
+            defer global.alloc.free(columns);
+            for (candidates.anchors.items, columns) |at, maybe_cols| {
+                const anchor = set.anchors[at];
+                const cols = maybe_cols orelse continue;
+                if (count_ptr.* < capacity) {
+                    if (out) |buf| buf[count_ptr.*] = .{ .index = anchor.index, .row = row_index, .x0 = @intCast(cols[0]), .x1 = @intCast(cols[1]), .tag = @intFromEnum(terminal.SearchResults.tag(anchor, surface.search.selected)) };
+                }
+                count_ptr.* += 1;
+            }
+        }
+        return count_ptr.* <= capacity and (count_ptr.* == 0 or out != null);
     }
 
     /// Tell the surface that it needs to schedule a render

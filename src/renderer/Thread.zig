@@ -183,6 +183,14 @@ pub fn init(
 /// Clean up the thread. This is only safe to call once the thread
 /// completes executing; the caller must join prior to this.
 pub fn deinit(self: *Thread) void {
+    // Stop has joined the producer/consumer threads. Release any undelivered
+    // embedded-search message reference without touching its opaque node keys.
+    while (self.mailbox.pop()) |message| {
+        switch (message) {
+            .search_results => |v| if (v.set) |set| set.release(),
+            else => {},
+        }
+    }
     self.stop.deinit();
     self.wakeup.deinit();
     self.render_h.deinit();
@@ -469,6 +477,13 @@ fn drainMailbox(self: *Thread) !void {
                 // allocators to match.
                 if (self.renderer.search_selected_match) |*m| m.arena.deinit();
                 self.renderer.search_selected_match = v;
+                self.renderer.search_matches_dirty = true;
+            },
+
+            .search_results => |v| {
+                if (self.renderer.search_results) |set| set.release();
+                self.renderer.search_results = v.set;
+                self.renderer.search_result_selected = v.selected;
                 self.renderer.search_matches_dirty = true;
             },
 

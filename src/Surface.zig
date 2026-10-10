@@ -1161,14 +1161,6 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
         },
 
         .search_selected => |v| {
-            // CNDF: the built-in search thread scrolls the viewport to a
-            // newly selected match (terminal/search/Thread.zig select)
-            // before it emits the selection event that produced this
-            // message, so the move has already happened. Tell external
-            // search consumers. A spurious notification (match already
-            // visible) is harmless.
-            if (v != null) self.io.searchNotify(false);
-
             _ = try self.rt_app.performAction(
                 .{ .surface = self },
                 .search_selected,
@@ -1192,7 +1184,6 @@ fn selectionScrollTick(self: *Surface) !void {
 
     // CNDF: the viewport moves below. Declared before the lock so it
     // runs after the unlock (defers run in reverse order).
-    defer self.io.searchNotify(false);
 
     // We need our locked state for the remainder
     self.renderer_state.mutex.lock();
@@ -1923,171 +1914,14 @@ pub const Text = struct {
     }
 };
 
-/// CNDF search bridge: a rectangle in framebuffer pixels with a top-left
-/// origin. Padding is included; no content scale is applied. The layout
-/// matches ghostty_search_rect_s.
-pub const SearchRect = extern struct {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-};
-
-/// CNDF search bridge: a contiguous run of rows of one page that is inside
-/// the viewport, and the viewport row of the chunk's first row.
-const SearchViewportChunk = struct {
-    chunk: terminal.PageList.PageIterator.Chunk,
-    row: usize,
-};
-
-/// CNDF search bridge: collect the page chunks that make up the viewport of
-/// the active screen. Looking pins up in this list is O(chunks), unlike
-/// PageList.pointFromPin which walks the page list for every pin. The
-/// result is owned by the caller.
-///
-/// Precondition: the renderer state mutex must be held.
-fn searchViewportChunks(
-    self: *Surface,
-    alloc: Allocator,
-) Allocator.Error![]SearchViewportChunk {
-    const pages = &self.io.terminal.screens.active.pages;
-
-    var list: std.ArrayListUnmanaged(SearchViewportChunk) = .empty;
-    errdefer list.deinit(alloc);
-
-    var row: usize = 0;
-    var it = pages.pageIterator(.right_down, .{ .viewport = .{} }, null);
-    while (it.next()) |chunk| {
-        try list.append(alloc, .{ .chunk = chunk, .row = row });
-        row += chunk.end - chunk.start;
-    }
-
-    return try list.toOwnedSlice(alloc);
-}
-
-/// CNDF search bridge: the viewport row of the pin, or null if the pin is
-/// outside of the viewport.
-fn searchViewportRow(
-    chunks: []const SearchViewportChunk,
-    pin: terminal.Pin,
-) ?usize {
-    for (chunks) |c| {
-        if (c.chunk.node != pin.node) continue;
-        if (pin.y < c.chunk.start or pin.y >= c.chunk.end) continue;
-        return c.row + (pin.y - c.chunk.start);
-    }
-
-    return null;
-}
-
-/// CNDF search bridge: the pixel rectangle of the columns [x, end) of a
-/// viewport row. Same cell/padding math as Coordinate.convert(.surface).
-fn searchRunRect(
-    size: rendererpkg.Size,
-    row: usize,
-    x: usize,
-    end: usize,
-) SearchRect {
-    const cell_w: f64 = @floatFromInt(size.cell.width);
-    const cell_h: f64 = @floatFromInt(size.cell.height);
-    const pad_x: f64 = @floatFromInt(size.padding.left);
-    const pad_y: f64 = @floatFromInt(size.padding.top);
-    return .{
-        .x = pad_x + @as(f64, @floatFromInt(x)) * cell_w,
-        .y = pad_y + @as(f64, @floatFromInt(row)) * cell_h,
-        .width = @as(f64, @floatFromInt(end - x)) * cell_w,
-        .height = cell_h,
-    };
-}
-
-/// CNDF search bridge: project terminal cells to framebuffer-pixel
-/// rectangles.
-///
-/// `cells` holds one pin per cell run head (a wide cell counts as two
-/// columns) in document order. Adjacent cells of the same viewport row are
-/// merged into one rectangle; cells outside of the viewport produce no
-/// rectangle and split runs. There is no clamping or approximation: every
-/// rectangle is exactly the union of the cells it covers.
-///
-/// Returns the number of rectangles. When `out` is non-null the rectangles
-/// are written to it, which must be at least that large (call once with
-/// null to size it).
-///
-/// Precondition: the renderer state mutex must be held and every pin must
-/// be known to be live (see Termio.searchEpoch).
-pub fn searchProjectLocked(
-    self: *Surface,
-    alloc: Allocator,
-    cells: []const terminal.Pin,
-    out: ?[]SearchRect,
-) Allocator.Error!usize {
-    const chunks = try self.searchViewportChunks(alloc);
-    defer alloc.free(chunks);
-
-    var count: usize = 0;
-    var run: ?struct { row: usize, x: usize, end: usize } = null;
-    for (cells) |pin| {
-        const row = searchViewportRow(chunks, pin) orelse {
-            // Not visible. Terminate the current run.
-            if (run) |r| {
-                if (out) |buf| buf[count] = searchRunRect(self.size, r.row, r.x, r.end);
-                count += 1;
-                run = null;
-            }
-            continue;
-        };
-
-        const width: usize = switch (pin.rowAndCell().cell.wide) {
-            .wide => 2,
-            .narrow, .spacer_tail, .spacer_head => 1,
-        };
-
-        if (run) |*r| {
-            if (r.row == row and r.end == pin.x) {
-                r.end = pin.x + width;
-                continue;
-            }
-
-            if (out) |buf| buf[count] = searchRunRect(self.size, r.row, r.x, r.end);
-            count += 1;
-        }
-
-        run = .{ .row = row, .x = pin.x, .end = pin.x + width };
-    }
-
-    if (run) |r| {
-        if (out) |buf| buf[count] = searchRunRect(self.size, r.row, r.x, r.end);
-        count += 1;
-    }
-
-    return count;
-}
-
-/// CNDF search bridge: make sure the cell of `pin` is visible. If it is
-/// already in the viewport the viewport is left alone (same behavior as
-/// the built-in search navigation), otherwise the viewport is scrolled so
-/// that the pin is its first row. A render is requested either way.
-///
-/// The caller must report the viewport move with `io.searchNotify(false)`
-/// once the renderer mutex is released.
-///
-/// Precondition: the renderer state mutex must be held and the pin must be
-/// known to be live (see Termio.searchEpoch).
-pub fn searchRevealLocked(
-    self: *Surface,
-    alloc: Allocator,
-    pin: terminal.Pin,
-) Allocator.Error!void {
-    const chunks = try self.searchViewportChunks(alloc);
-    defer alloc.free(chunks);
-
-    if (searchViewportRow(chunks, pin) == null) {
-        self.io.terminal.screens.active.scroll(.{ .pin = pin });
-    }
-
-    self.queueRender() catch |err| {
-        log.warn("error queueing render for search reveal err={}", .{err});
-    };
+/// Reveal a live, validated anchor. Caller holds renderer mutex. No viewport
+/// notification is emitted: search drawing is owned by renderer frames.
+pub fn searchRevealLocked(self: *Surface, pin: terminal.Pin) !void {
+    var it = self.io.terminal.screens.active.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
+    while (it.next()) |row| {
+        if (row.node == pin.node and row.y == pin.y) break;
+    } else self.io.terminal.screens.active.scroll(.{ .pin = pin });
+    try self.queueRender();
 }
 
 /// Grab the value of text at the given selection point. Note that the
@@ -2993,9 +2827,7 @@ pub fn keyCallback(
     // bottom. We also clear the selection for any key other then modifiers.
     if (!event.key.modifier()) {
         // CNDF: report the viewport move below once the lock is released.
-        defer if (self.config.scroll_to_bottom.keystroke) {
-            self.io.searchNotify(false);
-        };
+        defer if (self.config.scroll_to_bottom.keystroke) {};
 
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
@@ -3688,7 +3520,6 @@ pub fn scrollCallback(
 
     {
         // CNDF: report the viewport move below once the lock is released.
-        defer self.io.searchNotify(false);
 
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
@@ -5390,7 +5221,6 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             // CSI/ESC triggers a scroll.
             {
                 // CNDF: runs after the unlock below.
-                defer self.io.searchNotify(false);
 
                 self.renderer_state.mutex.lock();
                 defer self.renderer_state.mutex.unlock();
@@ -5420,7 +5250,6 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             // Text triggers a scroll.
             {
                 // CNDF: runs after the unlock below.
-                defer self.io.searchNotify(false);
 
                 self.renderer_state.mutex.lock();
                 defer self.renderer_state.mutex.unlock();
@@ -5436,7 +5265,6 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             // keys mode is NOT set.
             const normal = normal: {
                 // CNDF: runs after the unlock below.
-                defer self.io.searchNotify(false);
 
                 self.renderer_state.mutex.lock();
                 defer self.renderer_state.mutex.unlock();
@@ -5774,7 +5602,6 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .scroll_to_row => |n| {
             {
                 // CNDF: runs after the unlock below.
-                defer self.io.searchNotify(false);
 
                 self.renderer_state.mutex.lock();
                 defer self.renderer_state.mutex.unlock();
@@ -5788,7 +5615,6 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .scroll_to_selection => {
             {
                 // CNDF: runs after the unlock below.
-                defer self.io.searchNotify(false);
 
                 self.renderer_state.mutex.lock();
                 defer self.renderer_state.mutex.unlock();
@@ -6164,7 +5990,6 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         .adjust_selection => |direction| {
             // CNDF: adjusting may scroll the viewport. Runs after the
             // unlock below.
-            defer self.io.searchNotify(false);
 
             self.renderer_state.mutex.lock();
             defer self.renderer_state.mutex.unlock();
@@ -6441,7 +6266,6 @@ fn completeClipboardPaste(
 
     const encode_opts: input.paste.Options = encode_opts: {
         // CNDF: a paste scrolls to the bottom. Runs after the unlock below.
-        defer self.io.searchNotify(false);
 
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();

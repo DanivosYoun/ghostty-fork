@@ -70,13 +70,6 @@ last_cursor_reset: ?std.time.Instant = null,
 /// to keep track of any state or if its already been freed.
 thread_enter_state: ?*ThreadEnterState = null,
 
-/// CNDF search bridge: monotonic generation of the searchable terminal
-/// content. It is bumped when a mutation begins and again when it ends
-/// (see searchMutationBegin) so that Pins captured by a search document
-/// are never dereferenced after the content they point into changed.
-/// Protected by the renderer state mutex.
-search_epoch: u64 = 0,
-
 /// CNDF search bridge: number of content mutations currently in flight.
 /// Non-zero means the terminal may be observed half way through a mutation
 /// (the stream handler releases the renderer mutex mid-parse in some
@@ -488,20 +481,10 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
     }
 }
 
-/// CNDF search bridge: mark the start of a mutation of searchable terminal
-/// content (text, scrollback, screen switch, reflow).
-///
-/// The epoch is bumped here AND in searchMutationEnd. Bumping only at the
-/// end is not enough: the stream handler can drop the renderer mutex in
-/// the middle of parsing, and a document captured or projected in that
-/// window would otherwise match an epoch whose pins are already stale.
-///
-/// Precondition: the renderer state mutex must be held. Every
-/// searchMutationBegin must be paired with a searchMutationEnd under the
-/// same lock hold-or-reacquire (use defer).
+/// Capture consistency guard; paired under the renderer lock, including
+/// stream-handler lock drop/reacquire intervals. Mutations notify after end.
 pub inline fn searchMutationBegin(self: *Termio) void {
     self.search_mutating += 1;
-    self.search_epoch +%= 1;
 }
 
 /// CNDF search bridge: counterpart of searchMutationBegin.
@@ -510,21 +493,15 @@ pub inline fn searchMutationBegin(self: *Termio) void {
 pub inline fn searchMutationEnd(self: *Termio) void {
     assert(self.search_mutating > 0);
     self.search_mutating -= 1;
-    self.search_epoch +%= 1;
 }
 
-/// CNDF search bridge: the epoch a document captured right now would
-/// carry, or null while a mutation is in flight (nothing may be captured
-/// in that state).
-///
-/// Precondition: the renderer state mutex must be held.
-pub inline fn searchEpoch(self: *const Termio) ?u64 {
-    if (self.search_mutating > 0) return null;
-    return self.search_epoch;
+/// Precondition: renderer state mutex held.
+pub inline fn searchCaptureReady(self: *const Termio) bool {
+    return self.search_mutating == 0;
 }
 
-/// CNDF search bridge: tell the apprt that searchable content
-/// (`document == true`) or only the viewport changed. The apprt coalesces
+/// CNDF search bridge: report a searchable-document mutation. The bool is
+/// always true for ABI compatibility. The apprt coalesces
 /// these and delivers them on its main event thread.
 ///
 /// Must be called WITHOUT the renderer state mutex held, after the
@@ -725,9 +702,6 @@ pub fn scrollViewport(
     self: *Termio,
     scroll: terminalpkg.Terminal.ScrollViewport,
 ) void {
-    // Runs after the unlock below (defers run in reverse order).
-    defer self.searchNotify(false);
-
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
     self.terminal.scrollViewport(scroll);
@@ -741,7 +715,6 @@ pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
         self.terminal.screens.active.scroll(.{ .delta_prompt = delta });
     }
 
-    self.searchNotify(false);
     try self.renderer_wakeup.notify();
 }
 
@@ -815,7 +788,7 @@ fn processOutputLockedTapped(self: *Termio, buf: []const u8, fire_tap: bool) voi
     // CNDF: every VT byte stream may rewrite searchable content (print,
     // erase, scroll, screen switch, reset). The stream handler can release
     // the renderer mutex mid-parse, hence the begin/end pair rather than a
-    // single bump. This covers both the tapped and the NoTap paths.
+    // global epoch. This covers both the tapped and the NoTap paths.
     self.searchMutationBegin();
     defer self.searchMutationEnd();
 

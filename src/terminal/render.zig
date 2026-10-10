@@ -178,6 +178,8 @@ pub const RenderState = struct {
         /// The page pin. This is not safe to read unless you can guarantee
         /// the terminal state hasn't changed since the last `update` call.
         pin: PageList.Pin,
+        /// Copied under the terminal lock; pins are comparison-only afterwards.
+        serial: u64,
 
         /// Raw row data.
         raw: page.Row,
@@ -357,6 +359,7 @@ pub const RenderState = struct {
                     row_data.set(y, .{
                         .arena = .{},
                         .pin = undefined,
+                        .serial = 0,
                         .raw = undefined,
                         .cells = .empty,
                         .dirty = true,
@@ -425,6 +428,7 @@ pub const RenderState = struct {
             // apply to memory movement. This will let us remap any cell
             // pins back to an exact entry in our RenderState.
             row_pins[y] = row_pin;
+            row_data.items(.serial)[y] = row_pin.node.serial;
 
             // Get all our cells in the page.
             const p: *page.Page = &row_pin.node.data;
