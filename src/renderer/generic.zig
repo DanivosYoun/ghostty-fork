@@ -1405,6 +1405,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 overlay_features: []const Overlay.Feature,
             };
 
+            // CNDF: scroll-to-bottom-on-output moves the viewport here, on
+            // the renderer thread. External search consumers (the embedded
+            // search bridge) are told once the mutex is released; runtime
+            // support is opt-in via @hasDecl like Termio.searchNotify.
+            var viewport_scrolled = false;
+            defer if (viewport_scrolled) {
+                const rt_surface = self.surface_mailbox.surface.rt_surface;
+                const RtSurface = @TypeOf(rt_surface.*);
+                if (@hasDecl(RtSurface, "searchNotify")) {
+                    rt_surface.searchNotify(false);
+                }
+            };
+
             // Update all our data as tightly as possible within the mutex.
             var critical: Critical = critical: {
                 // NOTE: This code needs be updated to 0.16.0 before you
@@ -1444,6 +1457,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                     // Scroll
                     state.terminal.scrollViewport(.bottom);
+                    viewport_scrolled = true;
                 }
 
                 // Advance any running Kitty graphics animations to the

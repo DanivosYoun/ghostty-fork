@@ -73,6 +73,20 @@ last_cursor_reset: ?std.Io.Timestamp = null,
 /// to keep track of any state or if its already been freed.
 thread_enter_state: ?*ThreadEnterState = null,
 
+/// CNDF search bridge: monotonic generation of the searchable terminal
+/// content. It is bumped when a mutation begins and again when it ends
+/// (see searchMutationBegin) so that Pins captured by a search document
+/// are never dereferenced after the content they point into changed.
+/// Protected by the renderer state mutex.
+search_epoch: u64 = 0,
+
+/// CNDF search bridge: number of content mutations currently in flight.
+/// Non-zero means the terminal may be observed half way through a mutation
+/// (the stream handler releases the renderer mutex mid-parse in some
+/// cases), so search documents must not be captured. Protected by the
+/// renderer state mutex.
+search_mutating: u32 = 0,
+
 /// The state we need to keep around only until we enter the IO
 /// thread. Then we can throw it all away.
 const ThreadEnterState = struct {
@@ -520,6 +534,56 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
     };
 }
 
+/// CNDF search bridge: mark the start of a mutation of searchable terminal
+/// content (text, scrollback, screen switch, reflow).
+///
+/// The epoch is bumped here AND in searchMutationEnd. Bumping only at the
+/// end is not enough: the stream handler can drop the renderer mutex in
+/// the middle of parsing, and a document captured or projected in that
+/// window would otherwise match an epoch whose pins are already stale.
+///
+/// Precondition: the renderer state mutex must be held. Every
+/// searchMutationBegin must be paired with a searchMutationEnd under the
+/// same lock hold-or-reacquire (use defer).
+pub inline fn searchMutationBegin(self: *Termio) void {
+    self.search_mutating += 1;
+    self.search_epoch +%= 1;
+}
+
+/// CNDF search bridge: counterpart of searchMutationBegin.
+///
+/// Precondition: the renderer state mutex must be held.
+pub inline fn searchMutationEnd(self: *Termio) void {
+    assert(self.search_mutating > 0);
+    self.search_mutating -= 1;
+    self.search_epoch +%= 1;
+}
+
+/// CNDF search bridge: the epoch a document captured right now would
+/// carry, or null while a mutation is in flight (nothing may be captured
+/// in that state).
+///
+/// Precondition: the renderer state mutex must be held.
+pub inline fn searchEpoch(self: *const Termio) ?u64 {
+    if (self.search_mutating > 0) return null;
+    return self.search_epoch;
+}
+
+/// CNDF search bridge: tell the apprt that searchable content
+/// (`document == true`) or only the viewport changed. The apprt coalesces
+/// these and delivers them on its main event thread.
+///
+/// Must be called WITHOUT the renderer state mutex held, after the
+/// mutation it reports. Runtime support is opt-in via @hasDecl like
+/// readPtyTap so non-embedded apprts are unaffected.
+pub fn searchNotify(self: *Termio, document: bool) void {
+    const rt_surface = self.surface_mailbox.surface.rt_surface;
+    const RtSurface = @TypeOf(rt_surface.*);
+    if (@hasDecl(RtSurface, "searchNotify")) {
+        rt_surface.searchNotify(document);
+    }
+}
+
 /// Resize the terminal.
 pub fn resize(
     self: *Termio,
@@ -529,6 +593,9 @@ pub fn resize(
     self.size = size;
     const grid_size = size.grid();
 
+    // The resize reflows the grid and changes the cell size, so report it
+    // to the search bridge once we are out of the critical area below.
+    defer self.searchNotify(true);
     // Enter the critical area that we want to keep small
     {
         self.renderer_state.mutex.lockUncancelable(global.io());
@@ -538,6 +605,10 @@ pub fn resize(
         // Hold the same lock used by processOutput before notifying it, so
         // its redraw cannot be parsed against the old terminal dimensions.
         try self.backend.resize(grid_size, size.terminal());
+
+        // Reflow invalidates every Pin a search document captured.
+        self.searchMutationBegin();
+        defer self.searchMutationEnd();
 
         // Update the size of our terminal state
         try self.terminal.resize(
@@ -604,6 +675,11 @@ pub fn resetSynchronizedOutput(self: *Termio) void {
 /// Clear the screen.
 pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
     {
+        // Registered before the lock is taken so that it runs after the
+        // lock is released (defers run in reverse order).
+        var cleared = false;
+        defer if (cleared) self.searchNotify(true);
+
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
 
@@ -612,6 +688,11 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
         // knowledge of where the cursor is and causes rendering issues. So,
         // for alt screen, we do nothing.
         if (self.terminal.screens.active_key == .alternate) return;
+
+        // Everything below rewrites searchable content.
+        cleared = true;
+        self.searchMutationBegin();
+        defer self.searchMutationEnd();
 
         // Clear our selection
         self.terminal.screens.active.clearSelection();
@@ -662,6 +743,9 @@ pub fn scrollViewport(
     self: *Termio,
     scroll: terminalpkg.Terminal.ScrollViewport,
 ) void {
+    // Runs after the unlock below (defers run in reverse order).
+    defer self.searchNotify(false);
+
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     self.terminal.scrollViewport(scroll);
@@ -675,6 +759,7 @@ pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
         self.terminal.screens.active.scroll(.{ .delta_prompt = delta });
     }
 
+    self.searchNotify(false);
     try self.renderer_wakeup.notify();
 }
 
@@ -703,11 +788,16 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
 /// call with pty data but it is also called by the read thread when using
 /// an exec subprocess.
 pub fn processOutput(self: *Termio, buf: []const u8) void {
-    // We are modifying terminal state from here on out and we need
-    // the lock to grab our read data.
-    self.renderer_state.mutex.lockUncancelable(global.io());
-    defer self.renderer_state.mutex.unlock(global.io());
-    self.processOutputLocked(buf);
+    {
+        // We are modifying terminal state from here on out and we need
+        // the lock to grab our read data.
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        self.processOutputLocked(buf);
+    }
+
+    // CNDF: report the mutation to the search bridge outside the lock.
+    self.searchNotify(true);
 }
 
 /// CNDF: Process output WITHOUT firing the session-share read_pty tap.
@@ -724,9 +814,14 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
 /// from the PTY read thread; the host's real PTY data must always reach
 /// the tap so observers (session-share host, debug tooling) see it.
 pub fn processOutputNoTap(self: *Termio, buf: []const u8) void {
-    self.renderer_state.mutex.lock();
-    defer self.renderer_state.mutex.unlock();
-    self.processOutputLockedTapped(buf, false);
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        self.processOutputLockedTapped(buf, false);
+    }
+
+    // CNDF: report the mutation to the search bridge outside the lock.
+    self.searchNotify(true);
 }
 
 /// Process output from readdata but the lock is already held.
@@ -740,6 +835,13 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
 /// generating an echo through the embedder's PTY observer (see
 /// `processOutputNoTap`).
 fn processOutputLockedTapped(self: *Termio, buf: []const u8, fire_tap: bool) void {
+    // CNDF: every VT byte stream may rewrite searchable content (print,
+    // erase, scroll, screen switch, reset). The stream handler can release
+    // the renderer mutex mid-parse, hence the begin/end pair rather than a
+    // single bump. This covers both the tapped and the NoTap paths.
+    self.searchMutationBegin();
+    defer self.searchMutationEnd();
+
     // CNDF: Raw PTY tap for session sharing. Fire BEFORE VT parsing so
     // observers receive exactly what the shell wrote. Runtime support is
     // opt-in via @hasDecl so non-embedded apprts (gtk, none, browser) are
