@@ -168,6 +168,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         search_matches: ?renderer.Message.SearchMatches,
         search_selected_match: ?renderer.Message.SearchMatch,
         search_matches_dirty: bool,
+        search_results: ?*terminal.SearchResults = null,
+        search_result_selected: ?usize = null,
 
         /// The current set of cells to render. This is rebuilt on every frame
         /// but we keep this around so that we don't reallocate. Each set of
@@ -298,6 +300,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         const HighlightTag = enum(u8) {
             search_match,
             search_match_selected,
+            search_match_link,
         };
         /// Swap chain which maintains multiple copies of the state needed to
         /// render a frame, so that we can start building the next frame while
@@ -604,6 +607,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             selection_foreground: ?configpkg.Config.TerminalColor,
             search_background: configpkg.Config.TerminalColor,
             search_foreground: configpkg.Config.TerminalColor,
+            search_link_background: configpkg.Config.TerminalColor,
+            search_link_foreground: configpkg.Config.TerminalColor,
             search_selected_background: configpkg.Config.TerminalColor,
             search_selected_foreground: configpkg.Config.TerminalColor,
             bold_color: ?terminal.Style.BoldColor,
@@ -682,6 +687,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .selection_foreground = config.@"selection-foreground",
                     .search_background = config.@"search-background",
                     .search_foreground = config.@"search-foreground",
+                    .search_link_background = config.@"search-link-background",
+                    .search_link_foreground = config.@"search-link-foreground",
                     .search_selected_background = config.@"search-selected-background",
                     .search_selected_foreground = config.@"search-selected-foreground",
 
@@ -847,6 +854,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.terminal_state.deinit(self.alloc);
             if (self.search_selected_match) |*m| m.arena.deinit();
             if (self.search_matches) |*m| m.arena.deinit();
+            if (self.search_results) |set| set.release();
 
             self.latest_frame.deinit(global.io());
 
@@ -1405,19 +1413,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 overlay_features: []const Overlay.Feature,
             };
 
-            // CNDF: scroll-to-bottom-on-output moves the viewport here, on
-            // the renderer thread. External search consumers (the embedded
-            // search bridge) are told once the mutex is released; runtime
-            // support is opt-in via @hasDecl like Termio.searchNotify.
-            var viewport_scrolled = false;
-            defer if (viewport_scrolled) {
-                const rt_surface = self.surface_mailbox.surface.rt_surface;
-                const RtSurface = @TypeOf(rt_surface.*);
-                if (@hasDecl(RtSurface, "searchNotify")) {
-                    rt_surface.searchNotify(false);
-                }
-            };
-
             // Update all our data as tightly as possible within the mutex.
             var critical: Critical = critical: {
                 // NOTE: This code needs be updated to 0.16.0 before you
@@ -1457,7 +1452,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                     // Scroll
                     state.terminal.scrollViewport(.bottom);
-                    viewport_scrolled = true;
                 }
 
                 // Advance any running Kitty graphics animations to the
@@ -1615,6 +1609,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // NOTE: The order below matters. Highlights added earlier
                 // will take priority.
+
+                if (self.search_results) |set| {
+                    set.updateHighlights(self.alloc, &self.terminal_state, self.search_result_selected, .{ @intFromEnum(HighlightTag.search_match), @intFromEnum(HighlightTag.search_match_selected), @intFromEnum(HighlightTag.search_match_link) }) catch |err| {
+                        log.warn("error updating embedded search highlights err={}", .{err});
+                    };
+                }
 
                 if (self.search_selected_match) |m| {
                     self.terminal_state.updateHighlightsFlattened(
@@ -3083,6 +3083,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     selection,
                     search,
                     search_selected,
+                    search_link,
                 } = selected: {
                     // Order below matters for precedence.
 
@@ -3107,6 +3108,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             break :selected switch (tag) {
                                 .search_match => .search,
                                 .search_match_selected => .search_selected,
+                                .search_match_link => .search_link,
                             };
                         }
                     }
@@ -3141,6 +3143,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     } else state.colors.foreground,
 
                     .search => switch (self.config.search_background) {
+                        .color => |color| color.toTerminalRGB(),
+                        .@"cell-foreground" => if (style.flags.inverse) bg_style else fg_style,
+                        .@"cell-background" => if (style.flags.inverse) fg_style else bg_style,
+                    },
+
+                    .search_link => switch (self.config.search_link_background) {
                         .color => |color| color.toTerminalRGB(),
                         .@"cell-foreground" => if (style.flags.inverse) bg_style else fg_style,
                         .@"cell-background" => if (style.flags.inverse) fg_style else bg_style,
@@ -3185,6 +3193,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         } else state.colors.background,
 
                         .search => switch (self.config.search_foreground) {
+                            .color => |color| color.toTerminalRGB(),
+                            .@"cell-foreground" => if (style.flags.inverse) final_bg else fg_style,
+                            .@"cell-background" => if (style.flags.inverse) fg_style else final_bg,
+                        },
+
+                        .search_link => switch (self.config.search_link_foreground) {
                             .color => |color| color.toTerminalRGB(),
                             .@"cell-foreground" => if (style.flags.inverse) final_bg else fg_style,
                             .@"cell-background" => if (style.flags.inverse) fg_style else final_bg,

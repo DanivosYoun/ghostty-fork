@@ -13,27 +13,10 @@
 //!     that carries combining marks is text, not blank.
 //!   - Grapheme clusters are emitted whole (base codepoint + extensions).
 //!
-//! The row map is sparse: one `Row` per physical row holding the byte
-//! range it produced and a pin to its first cell. The ranges tile `text`
-//! exactly (`rows[i].end == rows[i + 1].start`), and a hard row's range
-//! includes its trailing "\n". There is no per-byte pin array; to find the
-//! column of a byte inside a row, re-walk that row's cells with the same
-//! rules; `cellsForRange` does exactly that for a byte range.
-//!
-//! OSC 8 hyperlinks are captured as byte spans over `text`. A span covers
-//! exactly the cells that carry the link, in order: a blank cell is part of
-//! a span only if it carries that same link itself (and only if it is
-//! emitted, i.e. text follows it on the line). A cell without the link, an
-//! unlinked blank gap or a hard line end closes the span, so two runs of
-//! the same link separated by such a gap are two spans, and a span never
-//! contains a "\n".
-//!
-//! LIFETIME: `text`, `rows` and `links` are owned by the document and
-//! independent of the terminal, so they stay valid after the terminal is
-//! destroyed. The `Pin`s in `rows` are NOT tracked: they point into the
-//! terminal's pages and are only dereferenceable while the caller has
-//! established that the same screen is alive and unchanged. `epoch` is
-//! opaque and supplied by the caller for exactly that comparison.
+//! The row map records physical identity and row-local byte ranges. Pins are
+//! untracked: after capture their node pointers may only be compared, never
+//! dereferenced. Content and serial are copied while the terminal lock is held.
+//! The same Walker supplies capture, hashing, and byte-to-column conversion.
 const SearchDocument = @This();
 
 const std = @import("std");
@@ -55,6 +38,9 @@ pub const Row = struct {
 
     /// First cell of the row. Untracked; see the lifetime note above.
     pin: Pin,
+    serial: u64,
+    hash: u64,
+    byte_len: usize,
 };
 
 /// A hyperlink span over `text`: [start, end).
@@ -68,7 +54,6 @@ pub const Link = struct {
 };
 
 alloc: Allocator,
-epoch: u64,
 text: []const u8,
 rows: []const Row,
 links: []const Link,
@@ -115,13 +100,119 @@ pub fn codepointBytes(cp: u21) usize {
     return encodeCodepoint(cp, &buf);
 }
 
+/// A cell view borrowed while the renderer mutex is held.
+pub const LiveView = struct {
+    page: *const Page,
+    cells: []const Cell,
+    pub fn len(self: LiveView) usize {
+        return self.cells.len;
+    }
+    pub fn raw(self: LiveView, x: usize) *const Cell {
+        return &self.cells[x];
+    }
+    pub fn grapheme(self: LiveView, x: usize) []const u21 {
+        return self.page.lookupGrapheme(&self.cells[x]) orelse &.{};
+    }
+};
+
+/// A view over render-state copies; safe outside the terminal lock.
+pub const RenderView = struct {
+    cells: std.MultiArrayList(@import("render.zig").RenderState.Cell).Slice,
+    pub fn len(self: RenderView) usize {
+        return self.cells.len;
+    }
+    pub fn raw(self: RenderView, x: usize) *const Cell {
+        return &self.cells.items(.raw)[x];
+    }
+    pub fn grapheme(self: RenderView, x: usize) []const u21 {
+        return self.cells.items(.grapheme)[x];
+    }
+};
+
+/// One walker for capture, hashing and range mapping. Wide spacers emit no
+/// bytes; blanks emit a provisional space, bounded by the captured byte_len.
+pub fn Walker(comptime View: type) type {
+    return struct {
+        view: View,
+        x: usize = 0,
+        pos: usize = 0,
+        const Self = @This();
+        pub const Token = struct {
+            cell: *const Cell,
+            grapheme: []const u21,
+            blank: bool,
+            x: usize,
+            width: usize,
+            start: usize,
+            end: usize,
+        };
+        pub fn init(view: View) Self {
+            return .{ .view = view };
+        }
+        pub fn next(self: *Self) ?Token {
+            while (self.x < self.view.len()) {
+                const x = self.x;
+                self.x += 1;
+                const cell = self.view.raw(x);
+                switch (cell.wide) {
+                    .spacer_head, .spacer_tail => continue,
+                    else => {},
+                }
+                const blank = isBlankCell(cell);
+                const grapheme = if (cell.content_tag == .codepoint_grapheme)
+                    self.view.grapheme(x)
+                else
+                    &.{};
+                const start = self.pos;
+                self.pos += if (blank) 1 else codepointBytes(cell.codepoint());
+                for (grapheme) |cp| self.pos += codepointBytes(cp);
+                return .{ .cell = cell, .grapheme = grapheme, .blank = blank, .x = x, .width = if (cell.wide == .wide) 2 else 1, .start = start, .end = self.pos };
+            }
+            return null;
+        }
+    };
+}
+
+pub fn rowHash(comptime View: type, view: View, wrap: bool) u64 {
+    var hash = std.hash.Wyhash.init(0);
+    const cols: u64 = @intCast(view.len());
+    hash.update(std.mem.asBytes(&cols));
+    hash.update(&.{@intFromBool(wrap)});
+    var walker = Walker(View).init(view);
+    while (walker.next()) |token| {
+        hash.update(&.{@intCast(token.width)});
+        var buf: [4]u8 = undefined;
+        const n = encodeCodepoint(if (token.blank) ' ' else token.cell.codepoint(), &buf);
+        hash.update(buf[0..n]);
+        for (token.grapheme) |cp| {
+            const len = encodeCodepoint(cp, &buf);
+            hash.update(buf[0..len]);
+        }
+    }
+    return hash.final();
+}
+
+pub fn columns(comptime View: type, view: View, byte_len: usize, range: Range) ?[2]usize {
+    var walker = Walker(View).init(view);
+    var result: ?[2]usize = null;
+    while (walker.next()) |token| {
+        if (token.start >= byte_len or token.start >= range.end) break;
+        if (token.end <= range.start) continue;
+        if (result) |*r| {
+            r[1] = token.x + token.width;
+        } else {
+            result = .{ token.x, token.x + token.width };
+        }
+    }
+    return result;
+}
+
 /// Capture the retained text of `screen` (all scrollback and the active
 /// area). The caller must hold whatever lock protects the screen for the
-/// duration of the call and supplies `epoch` read under that same lock.
+/// duration of the call.
 pub fn capture(
     alloc: Allocator,
     screen: *const Screen,
-    epoch: u64,
 ) Allocator.Error!SearchDocument {
     var text: std.ArrayList(u8) = .empty;
     errdefer text.deinit(alloc);
@@ -134,6 +225,9 @@ pub fn capture(
     }
 
     var open: ?Open = null;
+    var line_base: usize = 0;
+    var logical_bytes: usize = 0;
+    var last_text_end: usize = 0;
 
     // Blank cells are only turned into spaces once text follows them, so
     // trailing blanks of a hard line are dropped. Blanks pending at a
@@ -149,13 +243,12 @@ pub fn capture(
         const page = &pin.node.data;
         const row = page.getRow(pin.y);
         const cells = page.getCells(row);
-        const row_start = text.items.len;
-
-        for (cells) |*cell| {
-            switch (cell.wide) {
-                .narrow, .wide => {},
-                .spacer_head, .spacer_tail => continue,
-            }
+        const row_start = line_base + logical_bytes;
+        var walker = Walker(LiveView).init(.{ .page = page, .cells = cells });
+        while (walker.next()) |token| {
+            const cell = token.cell;
+            logical_bytes = row_start - line_base + token.end;
+            if (!token.blank) last_text_end = logical_bytes;
 
             const link = cellLink(page, cell);
 
@@ -183,33 +276,59 @@ pub fn capture(
 
             const start = text.items.len;
             try appendCodepoint(alloc, &text, cell.codepoint());
-            if (cell.content_tag == .codepoint_grapheme) {
-                if (page.lookupGrapheme(cell)) |cps| {
-                    for (cps) |cp| try appendCodepoint(alloc, &text, cp);
-                }
-            }
+            for (token.grapheme) |cp| try appendCodepoint(alloc, &text, cp);
             try trackLink(alloc, &links, &open, link, start, text.items.len);
         }
 
+        try rows.append(alloc, .{
+            .start = row_start,
+            .end = line_base + logical_bytes,
+            .pin = pin,
+            .serial = pin.node.serial,
+            .hash = rowHash(LiveView, .{ .page = page, .cells = cells }, row.wrap),
+            .byte_len = walker.pos,
+        });
+
         if (!row.wrap) {
-            // Hard line end: pending blanks are trimmed and no link
-            // continues over the newline.
             pending.clearRetainingCapacity();
             if (open) |o| {
                 try appendLink(alloc, &links, o);
                 open = null;
             }
+            // Blank cells carried across a wrap belong to the physical row
+            // they came from. Trim at the logical line end without consulting
+            // the next row during renderer byte-to-column conversion.
+            const end = line_base + last_text_end;
+            var i = rows.items.len;
+            while (i > 0) {
+                i -= 1;
+                const r = &rows.items[i];
+                if (r.end <= end) break;
+                r.start = @min(r.start, end);
+                r.end = @min(r.end, end);
+                r.byte_len = r.end - r.start;
+            }
             try text.append(alloc, '\n');
+            rows.items[rows.items.len - 1].end = text.items.len;
+            line_base = text.items.len;
+            logical_bytes = 0;
+            last_text_end = 0;
         }
-
-        try rows.append(alloc, .{
-            .start = row_start,
-            .end = text.items.len,
-            .pin = pin,
-        });
     }
 
     if (open) |o| try appendLink(alloc, &links, o);
+    if (logical_bytes > last_text_end) {
+        const end = line_base + last_text_end;
+        var i = rows.items.len;
+        while (i > 0) {
+            i -= 1;
+            const r = &rows.items[i];
+            if (r.end <= end) break;
+            r.start = @min(r.start, end);
+            r.end = @min(r.end, end);
+            r.byte_len = r.end - r.start;
+        }
+    }
 
     const text_owned = try text.toOwnedSlice(alloc);
     errdefer alloc.free(text_owned);
@@ -219,156 +338,10 @@ pub fn capture(
 
     return .{
         .alloc = alloc,
-        .epoch = epoch,
         .text = text_owned,
         .rows = rows_owned,
         .links = links_owned,
     };
-}
-
-/// What a physical row leaves pending at its end (see `cellsForRange`).
-const RowTail = enum { text, blank, empty };
-
-/// What a physical row leaves pending at its end: `blank` if its last
-/// counted cell is blank (those blanks carry into the next row of a
-/// soft-wrapped line), `text` if it ends in text, `empty` if it has no
-/// counted cells at all (spacers only).
-fn rowTail(pin: Pin) RowTail {
-    const page = &pin.node.data;
-    const cells = page.getCells(page.getRow(pin.y));
-    var i = cells.len;
-    while (i > 0) {
-        i -= 1;
-        const cell = &cells[i];
-        switch (cell.wide) {
-            .narrow, .wide => {},
-            .spacer_head, .spacer_tail => continue,
-        }
-
-        return if (isBlankCell(cell)) .blank else .text;
-    }
-
-    return .empty;
-}
-
-/// Maps the bytes [range.start, range.end) of `text` to the terminal cells
-/// that produced them, in document order, appending one Pin per cell (the
-/// head cell of a wide cell) to `cells`. Newline bytes have no cell, so a
-/// newline-only range appends nothing. A byte range touching only a
-/// combining mark yields the whole cell that holds it.
-///
-/// This re-walks the rows covering the range with exactly the rules of
-/// `capture` instead of keeping a per-byte pin map. The walk starts at the
-/// row containing range.start, moved back over soft-wrapped rows that end
-/// in blank cells, because those blanks are emitted as spaces at the start
-/// of the following row and must map back to their own cells.
-///
-/// Collection stops early once `limit` cells are resolved (more than
-/// `limit` may be appended when blanks were pending). The row byte ranges
-/// are cross-checked against the walk and any disagreement, or a range
-/// that starts beyond the text, fails with error.Inconsistent rather than
-/// returning guessed cells. `cells` may be left partially filled on error.
-///
-/// The caller must have established that the pins in `rows` are still
-/// live (same screen, unchanged since `epoch`), and holds the lock that
-/// protects the screen. The range is not validated for UTF-8 boundaries.
-pub fn cellsForRange(
-    self: *const SearchDocument,
-    alloc: Allocator,
-    range: Range,
-    limit: usize,
-    cells: *std.ArrayList(Pin),
-) (Allocator.Error || error{Inconsistent})!void {
-    const rows = self.rows;
-
-    // The first row whose byte range contains range.start. Rows tile
-    // the text, so this is a partition point.
-    var lo: usize = 0;
-    var hi: usize = rows.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        if (rows[mid].end > range.start) hi = mid else lo = mid + 1;
-    }
-    if (lo >= rows.len) return error.Inconsistent;
-
-    // Move back over rows whose pending blanks carry into this one.
-    var first = lo;
-    while (first > 0) {
-        const prev = rows[first - 1].pin;
-        if (!prev.rowAndCell().row.wrap) break;
-        if (rowTail(prev) == .text) break;
-        first -= 1;
-    }
-
-    // `pos` is the byte offset of the next byte the capture would emit.
-    // Blank cells are pending until text follows them; their cells are
-    // collected tentatively and dropped again if a hard line end discards
-    // them.
-    var pos: usize = rows[first].start;
-    var pending: usize = 0;
-    var mark: usize = cells.items.len;
-
-    for (rows[first..]) |row| {
-        const pin = row.pin;
-        const page = &pin.node.data;
-        const prow = page.getRow(pin.y);
-
-        for (page.getCells(prow), 0..) |*cell, x| {
-            switch (cell.wide) {
-                .narrow, .wide => {},
-                .spacer_head, .spacer_tail => continue,
-            }
-
-            const cell_pin: Pin = .{
-                .node = pin.node,
-                .y = pin.y,
-                .x = @intCast(x),
-            };
-
-            if (isBlankCell(cell)) {
-                if (pending == 0) mark = cells.items.len;
-                const at = pos + pending;
-                if (at >= range.start and at < range.end) {
-                    try cells.append(alloc, cell_pin);
-                }
-                pending += 1;
-                continue;
-            }
-
-            // Text: the pending blanks are emitted as spaces first.
-            pos += pending;
-            pending = 0;
-
-            var n = codepointBytes(cell.codepoint());
-            if (cell.content_tag == .codepoint_grapheme) {
-                if (page.lookupGrapheme(cell)) |cps| {
-                    for (cps) |cp| n += codepointBytes(cp);
-                }
-            }
-
-            if (pos < range.end and pos + n > range.start) {
-                try cells.append(alloc, cell_pin);
-            }
-            pos += n;
-
-            // Nothing is pending here, so everything collected is final.
-            if (pos >= range.end or cells.items.len >= limit) return;
-        }
-
-        if (!row.pin.rowAndCell().row.wrap) {
-            // Hard line end: pending blanks are trimmed, and the newline
-            // byte has no cell.
-            if (pending > 0) cells.shrinkRetainingCapacity(mark);
-            pending = 0;
-            pos += 1;
-            if (pos >= range.end or cells.items.len >= limit) return;
-        }
-
-        if (pos != row.end) return error.Inconsistent;
-    }
-
-    // The screen ended with blanks still pending: never emitted.
-    if (pending > 0) cells.shrinkRetainingCapacity(mark);
 }
 
 pub fn deinit(self: *SearchDocument) void {
@@ -500,10 +473,8 @@ test "SearchDocument captures scrollback and active screen" {
     }
     try s.nextSlice("NEEDLE");
 
-    var doc = try SearchDocument.capture(alloc, t.screens.active, 7);
+    var doc = try SearchDocument.capture(alloc, t.screens.active);
     defer doc.deinit();
-
-    try testing.expectEqual(@as(u64, 7), doc.epoch);
 
     // Scrolled-off lines are retained, in order, with hard newlines.
     try testing.expect(std.mem.startsWith(u8, doc.text, "line 0\nline 1\n"));
@@ -542,7 +513,7 @@ test "SearchDocument joins soft-wrapped rows" {
     // 16 chars wrap after column 10, then a hard line.
     try s.nextSlice("0123456789abcdef\r\nnext");
 
-    var doc = try SearchDocument.capture(alloc, t.screens.active, 0);
+    var doc = try SearchDocument.capture(alloc, t.screens.active);
     defer doc.deinit();
 
     try testing.expect(std.mem.startsWith(
@@ -571,7 +542,7 @@ test "SearchDocument captures hyperlinks, graphemes and wide cells" {
 
     try s.nextSlice("\x1b]8;id=a;http://x.test\x1b\\LINK\x1b]8;;\x1b\\ e\u{301}中x");
 
-    var doc = try SearchDocument.capture(alloc, t.screens.active, 0);
+    var doc = try SearchDocument.capture(alloc, t.screens.active);
     defer doc.deinit();
 
     try testing.expect(std.mem.startsWith(u8, doc.text, "LINK e\u{301}中x\n"));
@@ -605,7 +576,7 @@ test "SearchDocument isBlankCell: space with combining mark is text" {
     try testing.expect(!isBlankCell(&cells[4])); // space + U+0301
     try testing.expect(isBlankCell(&cells[10])); // never written
 
-    var doc = try SearchDocument.capture(alloc, t.screens.active, 0);
+    var doc = try SearchDocument.capture(alloc, t.screens.active);
     defer doc.deinit();
 
     // The mark survives, and its base space is neither trimmed nor merged.
@@ -629,7 +600,7 @@ test "SearchDocument link spans end at unlinked gaps" {
             "\x1b]8;id=a;http://x.test\x1b\\CD\x1b]8;;\x1b\\",
     );
 
-    var doc = try SearchDocument.capture(alloc, t.screens.active, 0);
+    var doc = try SearchDocument.capture(alloc, t.screens.active);
     defer doc.deinit();
 
     try testing.expect(std.mem.startsWith(u8, doc.text, "AB CD\n"));
@@ -656,7 +627,7 @@ test "SearchDocument link spans never contain a hard newline" {
     // carry the same link; they are still two spans.
     try s.nextSlice("\x1b]8;id=a;http://x.test\x1b\\AB\r\nCD\x1b]8;;\x1b\\");
 
-    var doc = try SearchDocument.capture(alloc, t.screens.active, 0);
+    var doc = try SearchDocument.capture(alloc, t.screens.active);
     defer doc.deinit();
 
     try testing.expect(std.mem.startsWith(u8, doc.text, "AB\nCD\n"));
@@ -682,181 +653,11 @@ test "SearchDocument link spans include linked spaces only" {
     // belong to the span; the unlinked "C" does not.
     try s.nextSlice("\x1b]8;id=a;http://x.test\x1b\\A B \x1b]8;;\x1b\\C");
 
-    var doc = try SearchDocument.capture(alloc, t.screens.active, 0);
+    var doc = try SearchDocument.capture(alloc, t.screens.active);
     defer doc.deinit();
 
     try testing.expect(std.mem.startsWith(u8, doc.text, "A B C\n"));
     try testing.expectEqual(@as(usize, 1), doc.links.len);
     try testing.expectEqual(@as(usize, 0), doc.links[0].start);
     try testing.expectEqual(@as(usize, 4), doc.links[0].end);
-}
-
-test "SearchDocument cellsForRange maps blanks carried over a soft wrap" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    var t = try Terminal.init(alloc, .{ .cols = 10, .rows = 5 });
-    defer t.deinit(alloc);
-
-    var s = t.vtStream();
-    defer s.deinit();
-
-    // Row 0 is "ab" plus eight blanks and soft-wraps into row 1, so the
-    // eight spaces are emitted at the start of row 1's byte range even
-    // though their cells are on row 0.
-    try s.nextSlice("ab        cd");
-
-    var doc = try SearchDocument.capture(alloc, t.screens.active, 0);
-    defer doc.deinit();
-    try testing.expect(std.mem.startsWith(u8, doc.text, "ab        cd\n"));
-    try testing.expectEqual(@as(usize, 2), doc.rows[0].end);
-    try testing.expectEqual(@as(usize, 2), doc.rows[1].start);
-
-    var cells: std.ArrayList(Pin) = .empty;
-    defer cells.deinit(alloc);
-
-    // All of the carried blanks: row 0, columns 2..9.
-    try doc.cellsForRange(alloc, .{ .start = 2, .end = 10 }, std.math.maxInt(usize), &cells);
-    try testing.expectEqual(@as(usize, 8), cells.items.len);
-    for (cells.items, 2..) |pin, x| {
-        try testing.expectEqual(@as(usize, 0), pin.y);
-        try testing.expectEqual(x, pin.x);
-    }
-
-    // A range that starts inside the carried blanks (but whose first row
-    // by byte offset is row 1).
-    cells.clearRetainingCapacity();
-    try doc.cellsForRange(alloc, .{ .start = 5, .end = 8 }, std.math.maxInt(usize), &cells);
-    try testing.expectEqual(@as(usize, 3), cells.items.len);
-    for (cells.items, 5..) |pin, x| {
-        try testing.expectEqual(@as(usize, 0), pin.y);
-        try testing.expectEqual(x, pin.x);
-    }
-
-    // A range crossing from the carried blanks into the continuation.
-    cells.clearRetainingCapacity();
-    try doc.cellsForRange(alloc, .{ .start = 8, .end = 12 }, std.math.maxInt(usize), &cells);
-    try testing.expectEqual(@as(usize, 4), cells.items.len);
-    try testing.expectEqual(@as(usize, 0), cells.items[0].y);
-    try testing.expectEqual(@as(usize, 8), cells.items[0].x);
-    try testing.expectEqual(@as(usize, 0), cells.items[1].y);
-    try testing.expectEqual(@as(usize, 9), cells.items[1].x);
-    try testing.expectEqual(@as(usize, 1), cells.items[2].y);
-    try testing.expectEqual(@as(usize, 0), cells.items[2].x);
-    try testing.expectEqual(@as(usize, 1), cells.items[3].y);
-    try testing.expectEqual(@as(usize, 1), cells.items[3].x);
-}
-
-test "SearchDocument cellsForRange trims blanks at hard line ends" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    var t = try Terminal.init(alloc, .{ .cols = 10, .rows = 5 });
-    defer t.deinit(alloc);
-
-    var s = t.vtStream();
-    defer s.deinit();
-
-    try s.nextSlice("ab   \r\ncd");
-
-    var doc = try SearchDocument.capture(alloc, t.screens.active, 0);
-    defer doc.deinit();
-    try testing.expect(std.mem.startsWith(u8, doc.text, "ab\ncd\n"));
-
-    var cells: std.ArrayList(Pin) = .empty;
-    defer cells.deinit(alloc);
-
-    // Everything: only the four text cells, never the trimmed blanks.
-    try doc.cellsForRange(alloc, .{ .start = 0, .end = 6 }, std.math.maxInt(usize), &cells);
-    try testing.expectEqual(@as(usize, 4), cells.items.len);
-    try testing.expectEqual(@as(usize, 0), cells.items[0].y);
-    try testing.expectEqual(@as(usize, 0), cells.items[0].x);
-    try testing.expectEqual(@as(usize, 0), cells.items[1].y);
-    try testing.expectEqual(@as(usize, 1), cells.items[1].x);
-    try testing.expectEqual(@as(usize, 1), cells.items[2].y);
-    try testing.expectEqual(@as(usize, 0), cells.items[2].x);
-    try testing.expectEqual(@as(usize, 1), cells.items[3].y);
-    try testing.expectEqual(@as(usize, 1), cells.items[3].x);
-
-    // A newline-only range maps to no cell, and is not an error.
-    cells.clearRetainingCapacity();
-    try doc.cellsForRange(alloc, .{ .start = 2, .end = 3 }, std.math.maxInt(usize), &cells);
-    try testing.expectEqual(@as(usize, 0), cells.items.len);
-
-    // A range that starts beyond the text is rejected, not clamped.
-    try testing.expectError(
-        error.Inconsistent,
-        doc.cellsForRange(
-            alloc,
-            .{ .start = doc.text.len, .end = doc.text.len + 1 },
-            std.math.maxInt(usize),
-            &cells,
-        ),
-    );
-}
-
-test "SearchDocument cellsForRange maps grapheme and wide cells" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    var t = try Terminal.init(alloc, .{ .cols = 10, .rows = 3 });
-    defer t.deinit(alloc);
-
-    var s = t.vtStream();
-    defer s.deinit();
-
-    // e + U+0301 (bytes 0..3, column 0), a wide cell (bytes 3..6, column
-    // 1, its spacer at column 2), x (byte 6, column 3).
-    try s.nextSlice("e\u{301}中x");
-
-    var doc = try SearchDocument.capture(alloc, t.screens.active, 0);
-    defer doc.deinit();
-    try testing.expect(std.mem.startsWith(u8, doc.text, "e\u{301}中x\n"));
-
-    var cells: std.ArrayList(Pin) = .empty;
-    defer cells.deinit(alloc);
-
-    // The combining mark alone yields the whole cell that holds it.
-    try doc.cellsForRange(alloc, .{ .start = 1, .end = 3 }, std.math.maxInt(usize), &cells);
-    try testing.expectEqual(@as(usize, 1), cells.items.len);
-    try testing.expectEqual(@as(usize, 0), cells.items[0].x);
-
-    // The wide character is one cell, its head.
-    cells.clearRetainingCapacity();
-    try doc.cellsForRange(alloc, .{ .start = 3, .end = 6 }, std.math.maxInt(usize), &cells);
-    try testing.expectEqual(@as(usize, 1), cells.items.len);
-    try testing.expectEqual(@as(usize, 1), cells.items[0].x);
-
-    // The whole line skips the spacer.
-    cells.clearRetainingCapacity();
-    try doc.cellsForRange(alloc, .{ .start = 0, .end = 7 }, std.math.maxInt(usize), &cells);
-    try testing.expectEqual(@as(usize, 3), cells.items.len);
-    try testing.expectEqual(@as(usize, 0), cells.items[0].x);
-    try testing.expectEqual(@as(usize, 1), cells.items[1].x);
-    try testing.expectEqual(@as(usize, 3), cells.items[2].x);
-}
-
-test "SearchDocument cellsForRange stops at limit" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-
-    var t = try Terminal.init(alloc, .{ .cols = 10, .rows = 5 });
-    defer t.deinit(alloc);
-
-    var s = t.vtStream();
-    defer s.deinit();
-
-    try s.nextSlice("ab\r\ncd");
-
-    var doc = try SearchDocument.capture(alloc, t.screens.active, 0);
-    defer doc.deinit();
-
-    var cells: std.ArrayList(Pin) = .empty;
-    defer cells.deinit(alloc);
-
-    // Whole document, but only the first cell is wanted.
-    try doc.cellsForRange(alloc, .{ .start = 0, .end = 6 }, 1, &cells);
-    try testing.expectEqual(@as(usize, 1), cells.items.len);
-    try testing.expectEqual(@as(usize, 0), cells.items[0].y);
-    try testing.expectEqual(@as(usize, 0), cells.items[0].x);
 }
