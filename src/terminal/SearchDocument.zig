@@ -238,9 +238,31 @@ pub fn capture(
     var pending: std.ArrayList(BlankRun) = .empty;
     defer pending.deinit(alloc);
 
+    // Read pages through PreservedPage so a capture never restores a
+    // compressed scrollback node (Node.page() would, undoing compression
+    // for the whole history). `open` and `pending` borrow link strings
+    // from page memory, so a node's preserved copy is kept until neither
+    // refers to it; held copies are released at the next node boundary
+    // with no borrow outstanding.
+    var held: std.ArrayList(PageList.List.Node.PreservedPage) = .empty;
+    defer {
+        for (held.items) |*p| p.deinit();
+        held.deinit(alloc);
+    }
+    var held_node: ?*const PageList.List.Node = null;
+
     var it = screen.pages.rowIterator(.right_down, .{ .screen = .{} }, null);
     while (it.next()) |pin| {
-        const page = pin.node.page();
+        if (held_node == null or held_node.? != pin.node) {
+            if (open == null and pending.items.len == 0) {
+                for (held.items) |*p| p.deinit();
+                held.clearRetainingCapacity();
+            }
+            try held.ensureUnusedCapacity(alloc, 1);
+            held.appendAssumeCapacity(try pin.node.pagePreservingState(alloc));
+            held_node = pin.node;
+        }
+        const page = held.items[held.items.len - 1].page();
         const row = page.getRow(pin.y);
         const cells = page.getCells(row);
         const row_start = line_base + logical_bytes;
@@ -461,7 +483,7 @@ test "SearchDocument captures scrollback and active screen" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var t = try Terminal.init(alloc, .{ .cols = 20, .rows = 5 });
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 5 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
@@ -469,9 +491,9 @@ test "SearchDocument captures scrollback and active screen" {
 
     for (0..30) |i| {
         var buf: [16]u8 = undefined;
-        try s.nextSlice(try std.fmt.bufPrint(&buf, "line {d}\r\n", .{i}));
+        s.nextSlice(try std.fmt.bufPrint(&buf, "line {d}\r\n", .{i}));
     }
-    try s.nextSlice("NEEDLE");
+    s.nextSlice("NEEDLE");
 
     var doc = try SearchDocument.capture(alloc, t.screens.active);
     defer doc.deinit();
@@ -504,14 +526,14 @@ test "SearchDocument joins soft-wrapped rows" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var t = try Terminal.init(alloc, .{ .cols = 10, .rows = 5 });
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 5 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
     defer s.deinit();
 
     // 16 chars wrap after column 10, then a hard line.
-    try s.nextSlice("0123456789abcdef\r\nnext");
+    s.nextSlice("0123456789abcdef\r\nnext");
 
     var doc = try SearchDocument.capture(alloc, t.screens.active);
     defer doc.deinit();
@@ -534,13 +556,13 @@ test "SearchDocument captures hyperlinks, graphemes and wide cells" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var t = try Terminal.init(alloc, .{ .cols = 20, .rows = 3 });
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 3 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
     defer s.deinit();
 
-    try s.nextSlice("\x1b]8;id=a;http://x.test\x1b\\LINK\x1b]8;;\x1b\\ e\u{301}中x");
+    s.nextSlice("\x1b]8;id=a;http://x.test\x1b\\LINK\x1b]8;;\x1b\\ e\u{301}中x");
 
     var doc = try SearchDocument.capture(alloc, t.screens.active);
     defer doc.deinit();
@@ -557,17 +579,17 @@ test "SearchDocument isBlankCell: space with combining mark is text" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var t = try Terminal.init(alloc, .{ .cols = 20, .rows = 3 });
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 3 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
     defer s.deinit();
 
     // A plain gap, then a space carrying U+0301, then more text.
-    try s.nextSlice("a  b \u{301}c");
+    s.nextSlice("a  b \u{301}c");
 
     // Direct check of the shared rule on the cells that were written.
-    const page = &t.screens.active.pages.getTopLeft(.screen).node.data;
+    const page = t.screens.active.pages.getTopLeft(.screen).node.page();
     const cells = page.getCells(page.getRow(0));
     try testing.expect(!isBlankCell(&cells[0])); // a
     try testing.expect(isBlankCell(&cells[1])); // plain space
@@ -583,11 +605,94 @@ test "SearchDocument isBlankCell: space with combining mark is text" {
     try testing.expect(std.mem.startsWith(u8, doc.text, "a  b \u{301}c\n"));
 }
 
+test "SearchDocument capture keeps compressed scrollback compressed" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // How many rows the first node holds before a second one is added.
+    const first_capacity: usize = probe: {
+        var p = try Terminal.init(testing.io, alloc, .{ .cols = 40, .rows = 5, .max_scrollback_bytes = null });
+        defer p.deinit(alloc);
+        var ps = p.vtStream();
+        defer ps.deinit();
+        while (p.screens.active.pages.pages.first.?.next == null) ps.nextSlice("plain\r\n");
+        break :probe p.screens.active.pages.pages.first.?.rows();
+    };
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 40, .rows = 5, .max_scrollback_bytes = null });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // A hyperlink soft-wrapped across the first node boundary: the open
+    // span borrows its URI from the first node's memory while capture is
+    // already reading the second node.
+    for (0..first_capacity - 2) |_| s.nextSlice("plain\r\n");
+    s.nextSlice("\x1b]8;id=x;https://example.test/span\x1b\\");
+    for (0..40) |_| s.nextSlice("linkedtext");
+    s.nextSlice("\x1b]8;;\x1b\\\r\n");
+    for (0..6000) |i| {
+        var buf: [32]u8 = undefined;
+        s.nextSlice(try std.fmt.bufPrint(&buf, "plain line {d}\r\n", .{i}));
+    }
+
+    var before = try SearchDocument.capture(alloc, t.screens.active);
+    defer before.deinit();
+
+    if (t.compress(.full) == .unsupported) return error.SkipZigTest;
+    const pages = &t.screens.active.pages;
+    var compressed: usize = 0;
+    var nodes: usize = 0;
+    var it = pages.pages.first;
+    while (it) |node| : (it = node.next) {
+        nodes += 1;
+        if (node.storage() == .compressed) compressed += 1;
+    }
+    try testing.expect(nodes > 3);
+    try testing.expect(compressed > 1);
+
+    var after = try SearchDocument.capture(alloc, t.screens.active);
+    defer after.deinit();
+
+    // Capture is read-only: no node was restored.
+    var still: usize = 0;
+    it = pages.pages.first;
+    while (it) |node| : (it = node.next) {
+        if (node.storage() == .compressed) still += 1;
+    }
+    try testing.expectEqual(compressed, still);
+
+    // Contents are identical to the resident capture, including the link
+    // span whose URI was borrowed from compressed nodes.
+    try testing.expectEqualStrings(before.text, after.text);
+    try testing.expectEqual(before.rows.len, after.rows.len);
+    try testing.expectEqual(before.links.len, after.links.len);
+    try testing.expect(after.links.len >= 1);
+    try testing.expectEqualStrings("https://example.test/span", after.links[0].uri);
+    for (before.links, after.links) |b, a| {
+        try testing.expectEqual(b.start, a.start);
+        try testing.expectEqual(b.end, a.end);
+        try testing.expectEqualStrings(b.uri, a.uri);
+    }
+    // The first span crosses a node boundary while open, and the node it
+    // started on was compressed when captured.
+    var start_node: ?*const PageList.List.Node = null;
+    var end_node: ?*const PageList.List.Node = null;
+    for (after.rows) |r| {
+        if (r.start <= after.links[0].start and after.links[0].start < r.end) start_node = r.pin.node;
+        if (r.start < after.links[0].end and after.links[0].end <= r.end) end_node = r.pin.node;
+    }
+    try testing.expect(start_node != null and end_node != null);
+    try testing.expect(start_node.? != end_node.?);
+    try testing.expect(start_node.?.storage() == .compressed);
+}
+
 test "SearchDocument link spans end at unlinked gaps" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var t = try Terminal.init(alloc, .{ .cols = 20, .rows = 3 });
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 3 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
@@ -595,7 +700,7 @@ test "SearchDocument link spans end at unlinked gaps" {
 
     // The same link (same explicit id and URI) twice, separated by one
     // unlinked space.
-    try s.nextSlice(
+    s.nextSlice(
         "\x1b]8;id=a;http://x.test\x1b\\AB\x1b]8;;\x1b\\ " ++
             "\x1b]8;id=a;http://x.test\x1b\\CD\x1b]8;;\x1b\\",
     );
@@ -617,7 +722,7 @@ test "SearchDocument link spans never contain a hard newline" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var t = try Terminal.init(alloc, .{ .cols = 20, .rows = 3 });
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 3 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
@@ -625,7 +730,7 @@ test "SearchDocument link spans never contain a hard newline" {
 
     // The link stays active across the line break, so both lines' cells
     // carry the same link; they are still two spans.
-    try s.nextSlice("\x1b]8;id=a;http://x.test\x1b\\AB\r\nCD\x1b]8;;\x1b\\");
+    s.nextSlice("\x1b]8;id=a;http://x.test\x1b\\AB\r\nCD\x1b]8;;\x1b\\");
 
     var doc = try SearchDocument.capture(alloc, t.screens.active);
     defer doc.deinit();
@@ -642,7 +747,7 @@ test "SearchDocument link spans include linked spaces only" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
-    var t = try Terminal.init(alloc, .{ .cols = 20, .rows = 3 });
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 3 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
@@ -651,7 +756,7 @@ test "SearchDocument link spans include linked spaces only" {
     // "A", a linked space, "B", a linked space, then an unlinked "C".
     // Both spaces carry the link and are emitted (text follows), so they
     // belong to the span; the unlinked "C" does not.
-    try s.nextSlice("\x1b]8;id=a;http://x.test\x1b\\A B \x1b]8;;\x1b\\C");
+    s.nextSlice("\x1b]8;id=a;http://x.test\x1b\\A B \x1b]8;;\x1b\\C");
 
     var doc = try SearchDocument.capture(alloc, t.screens.active);
     defer doc.deinit();

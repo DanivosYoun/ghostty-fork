@@ -2463,11 +2463,15 @@ pub const CAPI = struct {
             while (it) |node| : (it = node.next) {
                 // Only a LIVE list node is ever dereferenced.
                 if (@intFromPtr(node) != anchor.key.node or node.serial != anchor.key.serial) continue;
-                if (anchor.key.y >= node.page().size.rows) return false;
-                const row = node.page().getRow(@intCast(anchor.key.y));
+                if (anchor.key.y >= node.rows()) return false;
+                // Read without restoring a compressed scrollback node.
+                var preserved = node.pagePreservingState(global.alloc()) catch return false;
+                defer preserved.deinit();
+                const page = preserved.page();
+                const row = page.getRow(@intCast(anchor.key.y));
                 const view: terminal.SearchDocument.LiveView = .{
-                    .page = node.page(),
-                    .cells = node.page().getCells(row),
+                    .page = page,
+                    .cells = page.getCells(row),
                 };
                 const hash = terminal.SearchDocument.rowHash(terminal.SearchDocument.LiveView, view, row.wrap);
                 const cols = terminal.SearchResults.validatedColumns(terminal.SearchDocument.LiveView, view, row.wrap, hash, anchor) orelse return false;
@@ -2518,7 +2522,9 @@ pub const CAPI = struct {
         var it = screens.active.pages.rowIterator(.right_down, .{ .viewport = .{} }, null);
         while (it.next()) |pin| : (row_index += 1) {
             const candidates = set.rows.get(.{ .node = @intFromPtr(pin.node), .serial = pin.node.serial, .y = pin.y }) orelse continue;
-            const page = pin.node.page();
+            var preserved = pin.node.pagePreservingState(global.alloc()) catch return false;
+            defer preserved.deinit();
+            const page = preserved.page();
             const row = page.getRow(pin.y);
             const view: terminal.SearchDocument.LiveView = .{ .page = page, .cells = page.getCells(row) };
             const columns = set.validateRow(terminal.SearchDocument.LiveView, view, row.wrap, candidates, global.alloc()) catch return false;

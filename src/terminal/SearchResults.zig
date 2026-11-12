@@ -226,11 +226,11 @@ pub fn updateHighlights(self: *const SearchResults, alloc: Allocator, state: *Re
 
 test "SearchResults wrapped blanks and grapheme map identically from render copies" {
     const alloc = std.testing.allocator;
-    var terminal = try @import("Terminal.zig").init(alloc, .{ .cols = 10, .rows = 5 });
+    var terminal = try @import("Terminal.zig").init(std.testing.io, alloc, .{ .cols = 10, .rows = 5 });
     defer terminal.deinit(alloc);
     var stream = terminal.vtStream();
     defer stream.deinit();
-    try stream.nextSlice("ab        cd\r\ne\u{301}中x");
+    stream.nextSlice("ab        cd\r\ne\u{301}中x");
     var doc = try Doc.capture(alloc, terminal.screens.active);
     defer doc.deinit();
     try std.testing.expect(std.mem.startsWith(u8, doc.text, "ab        cd\ne\u{301}中x\n"));
@@ -255,25 +255,25 @@ test "SearchResults wrapped blanks and grapheme map identically from render copi
 
 test "SearchResults rejects invalid whole sets and preserves anchor selection" {
     const alloc = std.testing.allocator;
-    var terminal = try @import("Terminal.zig").init(alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 10_000 });
+    var terminal = try @import("Terminal.zig").init(std.testing.io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 10_000 });
     defer terminal.deinit(alloc);
     var stream = terminal.vtStream();
     defer stream.deinit();
-    try stream.nextSlice("NEEDLE\r\nhello\r\n");
+    stream.nextSlice("NEEDLE\r\nhello\r\n");
     var doc = try Doc.capture(alloc, terminal.screens.active);
     defer doc.deinit();
     const set = try create(alloc, 1, .primary, &doc, &.{.{ .start = 0, .end = 6 }});
     defer set.release();
     try std.testing.expectError(error.InvalidRange, create(alloc, 2, .primary, &doc, &.{.{ .start = 0, .end = 7 }}));
     try std.testing.expectError(error.InvalidRange, create(alloc, 2, .primary, &doc, &.{.{ .start = 0, .end = 0 }}));
-    try stream.nextSlice("hello\r\n");
+    stream.nextSlice("hello\r\n");
     var fresh = try Doc.capture(alloc, terminal.screens.active);
     defer fresh.deinit();
     const refreshed = try create(alloc, 3, .primary, &fresh, &.{.{ .start = 0, .end = 6 }});
     defer refreshed.release();
     try std.testing.expectEqual(@as(?usize, 0), refreshed.inheritedSelection(set, 0));
     // Prune and serial reuse must not match old opaque node pointers.
-    for (0..2000) |_| try stream.nextSlice("hello\r\n");
+    for (0..2000) |_| stream.nextSlice("hello\r\n");
     var pruned = try Doc.capture(alloc, terminal.screens.active);
     defer pruned.deinit();
     try std.testing.expect(std.mem.indexOf(u8, pruned.text, "NEEDLE") == null);
@@ -287,17 +287,30 @@ test "SearchResults rejects invalid whole sets and preserves anchor selection" {
     for (state.row_data.items(.highlights)) |hls| try std.testing.expectEqual(@as(usize, 0), hls.items.len);
 }
 
+/// Lap timer on the 0.17 std.Io clock (std.time.Timer was removed).
+const LapTimer = struct {
+    last: std.Io.Timestamp,
+    fn start() LapTimer {
+        return .{ .last = std.Io.Timestamp.now(std.testing.io, .awake) };
+    }
+    fn lap(self: *LapTimer) u64 {
+        const now = std.Io.Timestamp.now(std.testing.io, .awake);
+        defer self.last = now;
+        return @intCast(self.last.durationTo(now).nanoseconds);
+    }
+};
+
 test "SearchResults frame budget at configured scrollback limit" {
     const alloc = std.heap.page_allocator;
-    var terminal = try @import("Terminal.zig").init(alloc, .{ .cols = 80, .rows = 24, .max_scrollback = 10_000_000 });
+    var terminal = try @import("Terminal.zig").init(std.testing.io, alloc, .{ .cols = 80, .rows = 24, .max_scrollback_bytes = 10_000_000 });
     defer terminal.deinit(alloc);
     var stream = terminal.vtStream();
     defer stream.deinit();
     for (1..200001) |i| {
         var buf: [32]u8 = undefined;
-        try stream.nextSlice(try std.fmt.bufPrint(&buf, "{d}\r\n", .{i}));
+        stream.nextSlice(try std.fmt.bufPrint(&buf, "{d}\r\n", .{i}));
     }
-    var timer = try std.time.Timer.start();
+    var timer: LapTimer = .start();
     var doc = try Doc.capture(alloc, terminal.screens.active);
     defer doc.deinit();
     const capture_ns = timer.lap();
@@ -313,7 +326,7 @@ test "SearchResults frame budget at configured scrollback limit" {
     defer state.deinit(alloc);
     try state.update(alloc, &terminal);
     const runs = 500;
-    timer.reset();
+    _ = timer.lap();
     for (0..runs) |_| {
         for (state.row_data.items(.highlights)) |*hls| hls.clearRetainingCapacity();
     }
