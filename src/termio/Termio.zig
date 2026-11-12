@@ -720,9 +720,6 @@ pub fn scrollViewport(
     self: *Termio,
     scroll: terminalpkg.Terminal.ScrollViewport,
 ) void {
-    // Runs after the unlock below (defers run in reverse order).
-    defer self.searchNotify(false);
-
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     self.terminal.scrollViewport(scroll);
