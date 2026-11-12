@@ -791,8 +791,8 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
 /// the tap so observers (session-share host, debug tooling) see it.
 pub fn processOutputNoTap(self: *Termio, buf: []const u8) void {
     {
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
         self.processOutputLockedTapped(buf, false);
     }
 

@@ -177,7 +177,7 @@ pub fn init(
 pub fn deinit(self: *Thread) void {
     // Stop has joined the producer/consumer threads. Release any undelivered
     // embedded-search message reference without touching its opaque node keys.
-    while (self.mailbox.pop()) |message| {
+    while (self.mailbox.pop(global.io())) |message| {
         switch (message) {
             .search_results => |v| if (v.set) |set| set.release(),
             else => {},

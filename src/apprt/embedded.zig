@@ -2326,7 +2326,7 @@ pub const CAPI = struct {
         screen_key: terminal.ScreenSet.Key,
 
         fn destroy(self: *SearchHandle) void {
-            const alloc = global.alloc;
+            const alloc = global.alloc();
             alloc.free(self.links);
             self.doc.deinit();
             alloc.destroy(self);
@@ -2340,10 +2340,10 @@ pub const CAPI = struct {
         info: *SearchDocumentInfo,
     ) !*SearchHandle {
         const core = &surface.core_surface;
-        const alloc = global.alloc;
+        const alloc = global.alloc();
 
-        core.renderer_state.mutex.lock();
-        defer core.renderer_state.mutex.unlock();
+        core.renderer_state.mutex.lockUncancelable(global.io());
+        defer core.renderer_state.mutex.unlock(global.io());
 
         // A mutation is in flight (the stream handler dropped the mutex
         // mid-parse); there is no consistent state to capture. The mutation
@@ -2411,7 +2411,7 @@ pub const CAPI = struct {
     /// Transfer a retained immutable set to the renderer outside its lock.
     fn searchSend(surface: *Surface) void {
         const core = &surface.core_surface;
-        _ = core.renderer_thread.mailbox.push(.{ .search_results = .{
+        _ = core.renderer_thread.mailbox.push(global.io(), .{ .search_results = .{
             .set = if (surface.search.results) |set| set.retain() else null,
             .selected = surface.search.selected,
         } }, .forever);
@@ -2434,7 +2434,7 @@ pub const CAPI = struct {
         const out = out_set_id orelse return -2;
         // ABI ranges and document ranges have the same layout.
         const search_ranges: []const terminal.SearchDocument.Range = if (n == 0) &.{} else @as([*]const terminal.SearchDocument.Range, @ptrCast(ranges.?))[0..n];
-        const set = terminal.SearchResults.create(global.alloc, SearchBridge.nextId(), h.screen_key, &h.doc, search_ranges) catch |err| {
+        const set = terminal.SearchResults.create(global.alloc(), SearchBridge.nextId(), h.screen_key, &h.doc, search_ranges) catch |err| {
             log.warn("error committing search results err={}", .{err});
             return -2;
         };
@@ -2484,9 +2484,9 @@ pub const CAPI = struct {
         const set = surface.search.results orelse return false;
         if (set.id != set_id or index >= set.count()) return false;
         const mutex = surface.core_surface.renderer_state.mutex;
-        mutex.lock();
+        mutex.lockUncancelable(global.io());
         const valid = searchSelectLocked(surface, set, index, reveal);
-        mutex.unlock();
+        mutex.unlock(global.io());
         if (!valid) return false;
         surface.search.selected = index;
         searchSend(surface);
@@ -2510,8 +2510,8 @@ pub const CAPI = struct {
         const set = surface.search.results orelse return true;
         if (set.id != set_id) return false;
         const mutex = surface.core_surface.renderer_state.mutex;
-        mutex.lock();
-        defer mutex.unlock();
+        mutex.lockUncancelable(global.io());
+        defer mutex.unlock(global.io());
         const screens = &surface.core_surface.io.terminal.screens;
         if (screens.active_key != set.screen) return true;
         var row_index: u32 = 0;
@@ -2521,8 +2521,8 @@ pub const CAPI = struct {
             const page = &pin.node.data;
             const row = page.getRow(pin.y);
             const view: terminal.SearchDocument.LiveView = .{ .page = page, .cells = page.getCells(row) };
-            const columns = set.validateRow(terminal.SearchDocument.LiveView, view, row.wrap, candidates, global.alloc) catch return false;
-            defer global.alloc.free(columns);
+            const columns = set.validateRow(terminal.SearchDocument.LiveView, view, row.wrap, candidates, global.alloc()) catch return false;
+            defer global.alloc().free(columns);
             for (candidates.anchors.items, columns) |at, maybe_cols| {
                 const anchor = set.anchors[at];
                 const cols = maybe_cols orelse continue;
@@ -2587,9 +2587,9 @@ pub const CAPI = struct {
     /// Safe to call at any time; locks the renderer state mutex briefly.
     export fn ghostty_surface_cursor_position(surface: *Surface) CursorPosition {
         const core = &surface.core_surface;
-        core.renderer_state.mutex.lock();
+        core.renderer_state.mutex.lockUncancelable(global.io());
         const cursor = core.renderer_state.terminal.screens.active.cursor;
-        core.renderer_state.mutex.unlock();
+        core.renderer_state.mutex.unlock(global.io());
         return .{
             .cell_col = @intCast(cursor.x),
             .cell_row = @intCast(cursor.y),
@@ -2654,8 +2654,8 @@ pub const CAPI = struct {
         // Build the dump under the renderer mutex so the screen we serialize
         // is not mutated mid-format. The mutex also protects the palette and
         // mode state we read out of the terminal.
-        core.renderer_state.mutex.lock();
-        defer core.renderer_state.mutex.unlock();
+        core.renderer_state.mutex.lockUncancelable(global.io());
+        defer core.renderer_state.mutex.unlock(global.io());
 
         const term = core.renderer_state.terminal;
 

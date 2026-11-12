@@ -124,6 +124,8 @@ pub const Backend = union(Kind) {
     pub fn getProcessInfo(self: *Backend, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
         return switch (self.*) {
             .exec => |*exec| exec.getProcessInfo(info),
+            // CNDF external_io: the embedder owns the process; nothing to report.
+            .external_io => null,
         };
     }
 };
