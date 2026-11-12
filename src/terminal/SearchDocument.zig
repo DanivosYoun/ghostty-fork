@@ -240,7 +240,7 @@ pub fn capture(
 
     var it = screen.pages.rowIterator(.right_down, .{ .screen = .{} }, null);
     while (it.next()) |pin| {
-        const page = &pin.node.data;
+        const page = pin.node.page();
         const row = page.getRow(pin.y);
         const cells = page.getCells(row);
         const row_start = line_base + logical_bytes;
