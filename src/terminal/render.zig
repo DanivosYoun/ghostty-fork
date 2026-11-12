@@ -478,8 +478,6 @@ pub const RenderState = struct {
         /// not be dereferenced unless the terminal state is protected from
         /// changes since the last `update` call.
         pin: PageList.Pin,
-        /// Copied under the terminal lock; pins are comparison-only afterwards.
-        serial: u64,
 
         /// The page node generation captured alongside `pin`. This lets
         /// consumers validate the pin without dereferencing its node after
