@@ -120,6 +120,13 @@ pub fn init(opts: InitOpts) !void {
         .environ = self.environ,
     });
 
+    // The C API hands us the embedder's libc `environ`, which it may keep
+    // mutating with setenv/unsetenv after we return. Copy it so everything
+    // below (and every later environ()/environMap()) reads our own block.
+    if (comptime std.process.Environ.Block == std.process.Environ.PosixBlock) {
+        if (opts == .c) try ownEnviron(self, self.environ);
+    }
+
     // Discover and save the temporary directory path
     self.tmp_dir_path = try allocTmpDir(self.alloc, self.environ);
 
@@ -206,7 +213,7 @@ pub fn init(opts: InitOpts) !void {
     //
     // We need to re-sync the environment after this completes.
     try internal_os.ensureLocale();
-    syncEnviron();
+    try syncEnvironOwned();
 
     // Initialize glslang for shader compilation
     try glslang.init();
@@ -242,6 +249,10 @@ pub fn deinit() void {
 
     // Release our I/O instance
     self.io_impl.deinit();
+
+    // The I/O instance and tmp_dir_path read from these, so free them last.
+    for (self.owned_environs.items) |block| block.deinit(self.alloc);
+    self.owned_environs.deinit(self.alloc);
 
     if (self.gpa) |*value| {
         // We want to ensure that we deinit the GPA because this is
@@ -305,20 +316,45 @@ pub fn environMap() !std.process.Environ.Map {
 /// `unsetenv` - as a rule, beyond initialization, favor
 /// `std.process.Environ.Map` whenever possible.
 pub fn syncEnviron() void {
+    syncEnvironOwned() catch |err| {
+        // Keep the previous copy: it is still valid, just older.
+        std.log.warn("failed to re-sync environment, keeping previous copy err={}", .{err});
+    };
+}
+
+/// syncEnviron, reporting allocation failure. The libc vector and its strings
+/// are only borrowed for the duration of the copy: a later setenv/unsetenv may
+/// free or shift them, so we never keep pointers into them.
+fn syncEnvironOwned() std.mem.Allocator.Error!void {
     switch (builtin.target.os.tag) {
         .windows => {},
         else => {
             assert(builtin.link_libc);
             assert(!builtin.is_test);
-            const new_environ: std.process.Environ = .{ .block = .{ .slice = std.c.environ[0..env_len: {
+            const libc_environ: std.process.Environ = .{ .block = .{ .slice = std.c.environ[0..env_len: {
                 var len: usize = 0;
                 while (std.c.environ[len]) |_| : (len += 1) {}
                 break :env_len len;
             } :null] } };
-            state.?.environ = new_environ;
-            state.?.io_impl.environ = .{ .process_environ = new_environ };
+            try ownEnviron(&state.?, libc_environ);
         },
     }
+}
+
+/// Makes `self.environ` and `self.io_impl` use a copy of `source` owned by the
+/// global state. Earlier copies are retired, not freed: values derived from
+/// them (tmp_dir_path, environ() results held by callers) stay valid until
+/// deinit. The number of copies is bounded by the number of syncs (init and a
+/// few apprt startup paths).
+fn ownEnviron(self: *GlobalState, source: std.process.Environ) std.mem.Allocator.Error!void {
+    try self.owned_environs.ensureUnusedCapacity(self.alloc, 1);
+    const block = try source.createPosixBlock(self.alloc, .{});
+    self.owned_environs.appendAssumeCapacity(block);
+    const new_environ: std.process.Environ = .{ .block = block };
+    self.environ = new_environ;
+    self.io_impl.environ = .{ .process_environ = new_environ };
+    // The I/O memo (PATH, TERM, NO_COLOR...) pointed into the previous block.
+    self.io_impl.environ_initialized = new_environ.block.isEmpty();
 }
 
 /// Helper to return either the state's args, or one from testing.
@@ -381,6 +417,9 @@ pub const GlobalState = struct {
     gpa: ?GPA,
     alloc: std.mem.Allocator,
     environ: std.process.Environ,
+    /// Environment blocks copied by ownEnviron; the last one is `environ`.
+    /// Freed in deinit after the I/O instance.
+    owned_environs: std.ArrayList(std.process.Environ.PosixBlock) = .empty,
     args: std.process.Args,
     tmp_dir_path: ?[]const u8,
     action: ?cli.ghostty.Action,
