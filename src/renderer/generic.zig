@@ -253,6 +253,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// resources. Creating any GPU resource while this is false is invalid.
         display_realized: bool = true,
 
+        /// CNDF: the render coalescing output generation contained in the
+        /// last `updateFrame` snapshot, read under the snapshot's lock.
+        /// The renderer thread clears it before each update; it stays null
+        /// when no snapshot was taken (synchronized output).
+        snapshot_output_generation: ?u64 = null,
+
+        /// CNDF: a coalesced frame is waiting for the next display link
+        /// tick, so the link must keep running even though no cells were
+        /// rebuilt yet. Set by the renderer thread.
+        coalesce_pending: bool = false,
+
         /// Our swap chain (multiple buffering). Null when it has
         /// been released, either because the surface is hidden
         /// (`releaseGpuResources`) or because the display is
@@ -960,7 +971,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // If we don't support a display link we have no work to do.
             if (comptime DisplayLink == void) return;
 
-            self.syncDisplayLink(null, &thr.draw_now);
+            self.syncDisplayLink(null, &thr.display_tick);
         }
 
         /// Called by renderer.Thread when it exits the main loop.
@@ -1085,9 +1096,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// draws a frame.
         fn displayLinkCallback(
             _: *macos.video.DisplayLink,
-            ud: ?*xev.Async,
+            ud: ?*renderer.Thread.DisplayTick,
         ) void {
-            const draw_now = ud orelse return;
+            const tick = ud orelse return;
+            // CNDF: record the tick for the coalescing cadence. Only an
+            // atomic write; the renderer thread does the rest.
+            tick.record(renderer.State.coalesceNowNs(global.io()));
+            const draw_now = tick.draw_now orelse return;
             draw_now.notify() catch |err| {
                 log.err("error notifying draw_now err={}", .{err});
             };
@@ -1106,10 +1121,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         pub fn setMacOSDisplayID(
             self: *Self,
             id: u32,
-            draw_now: *xev.Async,
+            draw_now: *renderer.Thread.DisplayTick,
         ) !void {
             if (comptime DisplayLink == void) return;
             self.syncDisplayLink(id, draw_now);
+        }
+
+        /// CNDF: keep the display link running for a pending coalesced
+        /// frame, or release that keepalive.
+        ///
+        /// Must be called on the render thread.
+        pub fn setCoalescePending(self: *Self, pending: bool) void {
+            if (self.coalesce_pending == pending) return;
+            self.coalesce_pending = pending;
+            self.syncDisplayLink(null, null);
         }
 
         /// The cadence of continuous (draw-only) animation wakes,
@@ -1281,7 +1306,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         fn syncDisplayLink(
             self: *Self,
             display_id: ?u32,
-            draw_now: ?*xev.Async,
+            draw_now: ?*renderer.Thread.DisplayTick,
         ) void {
             if (comptime DisplayLink == void) return;
 
@@ -1290,7 +1315,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const callback = draw_now orelse return;
                 const result = DisplayLink.create(
                     self.alloc,
-                    xev.Async,
+                    renderer.Thread.DisplayTick,
                     &displayLinkCallback,
                     callback,
                 ) catch |err| {
@@ -1314,6 +1339,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Only vsync if we have cell or image changes or animation
                 (self.cells_rebuilt or
                     self.images_rebuilt or
+                    // CNDF: a coalesced frame is due on the next tick
+                    self.coalesce_pending or
                     self.animationWake() != null);
 
             display_link.setRunning(should_run);
@@ -1433,6 +1460,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     log.debug("synchronized output started, skipping render", .{});
                     return;
                 }
+
+                // CNDF: the output generation this snapshot contains. Read
+                // under the same lock the parser advances it under.
+                self.snapshot_output_generation =
+                    state.coalesce.output_generation.load(.acquire);
 
                 // If scroll-to-bottom on output is enabled, check if the final line
                 // changed by comparing the bottom-right pin. If the node pointer or

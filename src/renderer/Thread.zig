@@ -58,6 +58,20 @@ animation_wake: rendererpkg.Renderer.AnimationWake.Kind = .draw,
 draw_now: xev.Async,
 draw_now_c: xev.Completion = .{},
 
+/// CNDF: display refresh ticks recorded by the display link callback. See
+/// `DisplayTick`.
+display_tick: DisplayTick = .{},
+
+/// CNDF: render coalescing policy state (`cndf-render-coalesce`). Owned by
+/// this thread.
+coalescer: Coalescer = .{},
+
+/// CNDF: one-shot watchdog for a coalesced frame, in case the display link
+/// tick it waits for never arrives. Separate from the animation timer.
+coalesce_h: xev.Timer,
+coalesce_c: xev.Completion = .{},
+coalesce_c_cancel: xev.Completion = .{},
+
 /// The timer used for cursor blinking
 cursor_h: xev.Timer,
 cursor_c: xev.Completion = .{},
@@ -102,10 +116,12 @@ flags: packed struct {
 
 pub const DerivedConfig = struct {
     scrollback_compression: bool,
+    render_coalesce: bool,
 
     pub fn init(config: *const configpkg.Config) DerivedConfig {
         return .{
             .scrollback_compression = config.@"scrollback-compression",
+            .render_coalesce = config.@"cndf-render-coalesce",
         };
     }
 };
@@ -140,6 +156,10 @@ pub fn init(
     var draw_now = try xev.Async.init();
     errdefer draw_now.deinit();
 
+    // CNDF: coalesced frame watchdog.
+    var coalesce_h = try xev.Timer.init();
+    errdefer coalesce_h.deinit();
+
     // Setup a timer for blinking the cursor
     var cursor_timer = try xev.Timer.init();
     errdefer cursor_timer.deinit();
@@ -148,14 +168,17 @@ pub fn init(
     var mailbox = try Mailbox.create(alloc);
     errdefer mailbox.destroy(alloc);
 
+    const derived: DerivedConfig = .init(config);
     var result: Thread = .{
         .alloc = alloc,
-        .config = .init(config),
+        .config = derived,
+        .coalescer = .{ .enabled = derived.render_coalesce },
         .loop = loop,
         .wakeup = wakeup_h,
         .stop = stop_h,
         .render_h = render_h,
         .draw_now = draw_now,
+        .coalesce_h = coalesce_h,
         .cursor_h = cursor_timer,
         .surface = surface,
         .renderer = renderer_impl,
@@ -187,6 +210,7 @@ pub fn deinit(self: *Thread) void {
     self.wakeup.deinit();
     self.render_h.deinit();
     self.draw_now.deinit();
+    self.coalesce_h.deinit();
     self.cursor_h.deinit();
     if (comptime terminalpkg.compression_enabled)
         self.compression.deinit();
@@ -225,6 +249,10 @@ fn threadMain_(self: *Thread) !void {
     // Setup our thread QoS
     self.setQosClass();
 
+    // CNDF: the display link callback reaches draw_now through the tick
+    // record, which needs our final address.
+    self.display_tick.draw_now = &self.draw_now;
+
     // Run our loop start/end callbacks if the renderer cares.
     const has_loop = @hasDecl(rendererpkg.Renderer, "loopEnter");
     if (has_loop) try self.renderer.loopEnter(self);
@@ -261,6 +289,10 @@ fn threadMain_(self: *Thread) !void {
     // Run
     log.debug("starting renderer thread", .{});
     defer log.debug("starting renderer thread shutdown", .{});
+    defer if (self.config.render_coalesce) log.info(
+        "render coalesce counters {f}",
+        .{self.coalescer.counters},
+    );
     _ = try self.loop.run(.until_done);
 }
 
@@ -308,6 +340,16 @@ fn drainMailbox(self: *Thread) !void {
 
     while (self.mailbox.pop(global.io())) |message| {
         log.debug("mailbox message={}", .{message});
+
+        // CNDF: everything but the periodic cursor blink reset and
+        // presentation health is a UI change whose frame must not wait for
+        // a coalesced tick. `.reset_cursor_blink` is deliberately not an
+        // input signal: termio sends it about every 500ms during output.
+        switch (message) {
+            .reset_cursor_blink, .presentation_health => {},
+            else => self.coalescer.mailbox_immediate = true,
+        }
+
         switch (message) {
             .crash => @panic("crash request, crashing intentionally"),
 
@@ -317,6 +359,9 @@ fn drainMailbox(self: *Thread) !void {
 
                 // Set our visible state
                 self.flags.visible = v;
+
+                // CNDF: the display link restarts with a new cadence.
+                self.coalescer.resetCadence();
 
                 // Visibility affects our QoS class
                 self.setQosClass();
@@ -451,8 +496,11 @@ fn drainMailbox(self: *Thread) !void {
 
             .macos_display_id => |v| {
                 if (@hasDecl(rendererpkg.Renderer, "setMacOSDisplayID")) {
-                    try self.renderer.setMacOSDisplayID(v, &self.draw_now);
+                    try self.renderer.setMacOSDisplayID(v, &self.display_tick);
                 }
+
+                // CNDF: a new display has its own refresh period.
+                self.coalescer.resetCadence();
             },
         }
     }
@@ -470,6 +518,11 @@ fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
     }
 
     self.config = config.*;
+
+    // CNDF: disabling drops any pending coalesced frame. The config change
+    // already forces an immediate update for this wake (mailbox), which
+    // reflects the final state; from then on the upstream path is used.
+    self.coalescer.enabled = config.render_coalesce;
 }
 
 /// Trigger a draw. This will not update frame data or anything, it will
@@ -504,8 +557,13 @@ fn wakeupCallback(
     t.drainMailbox() catch |err|
         log.err("error draining mailbox err={}", .{err});
 
-    // Render immediately
-    _ = renderCallback(t, undefined, undefined, {});
+    // CNDF: render immediately unless this wake is bulk native output that
+    // can join the next display refresh (see `Coalescer`).
+    switch (t.coalesceDecide()) {
+        .update => _ = renderCallback(t, undefined, undefined, {}),
+        .wait => {},
+        .wait_new => t.startCoalescePending(),
+    }
 
     // PageList mutations maintain their own compression dirty state. Checking
     // it here covers output, resize, and viewport scrolling uniformly.
@@ -542,11 +600,92 @@ fn drawNowCallback(
         return .rearm;
     };
 
-    // Draw immediately
     const t = self_.?;
+
+    // CNDF: record the display cadence, then fold a coalesced frame into
+    // this tick. The frame data is updated BEFORE the draw so it is shown
+    // on this refresh, not the next one.
+    t.coalescer.onTick(t.display_tick.load());
+    if (t.coalescer.pending) {
+        t.coalescer.counters.tick_flush += 1;
+        _ = renderCallback(t, undefined, undefined, {});
+    }
+
+    // Draw immediately
     t.drawFrame(true);
 
     return .rearm;
+}
+
+/// CNDF: decide how to handle a renderer wake. Called after the mailbox
+/// is drained.
+fn coalesceDecide(t: *Thread) Coalescer.Decision {
+    const shared = &t.state.coalesce;
+
+    // Consume the immediate request even when disabled so a stale request
+    // never leaks into a later enable.
+    const requested = shared.immediate.swap(false, .acq_rel);
+    const mailbox = t.coalescer.mailbox_immediate;
+    t.coalescer.mailbox_immediate = false;
+
+    if (!t.coalescer.enabled) return .update;
+
+    return t.coalescer.onWake(.{
+        .now_ns = rendererpkg.State.coalesceNowNs(global.io()),
+        .generation = shared.output_generation.load(.acquire),
+        .idle_through = shared.idle_through_generation.load(.acquire),
+        .input_ns = shared.input_ns.load(.acquire),
+        .immediate = requested or mailbox or t.flags.has_inspector,
+        .vsync = t.flags.visible and
+            t.renderer.display_realized and
+            t.renderer.hasVsync(),
+    });
+}
+
+/// CNDF: a coalesced frame just became pending. Keep the display link
+/// running for it and arm the one-shot watchdog at first pending + P. The
+/// deadline is never extended by later output.
+fn startCoalescePending(t: *Thread) void {
+    t.renderer.setCoalescePending(true);
+    t.coalesce_h.reset(
+        &t.loop,
+        &t.coalesce_c,
+        &t.coalesce_c_cancel,
+        t.coalescer.watchdogDelayMs(),
+        Thread,
+        t,
+        coalesceWatchdogCallback,
+    );
+}
+
+/// CNDF: the display link tick a coalesced frame waited for did not come
+/// within one period. Update and draw now, and re-learn the cadence.
+fn coalesceWatchdogCallback(
+    self_: ?*Thread,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    _ = r catch |err| switch (err) {
+        // Superseded by a newer pending frame's deadline.
+        error.Canceled => return .disarm,
+        else => {
+            log.warn("error in coalesce watchdog err={}", .{err});
+            return .disarm;
+        },
+    };
+    const t = self_ orelse return .disarm;
+
+    // Already reflected by a tick, input, idle flush or animation.
+    if (!t.coalescer.pending) return .disarm;
+
+    t.coalescer.counters.watchdog += 1;
+    t.coalescer.resetCadence();
+    _ = renderCallback(t, undefined, undefined, {});
+
+    // renderCallback only draws on its own without vsync.
+    if (t.renderer.hasVsync()) t.drawFrame(true);
+    return .disarm;
 }
 
 fn renderCallback(
@@ -568,6 +707,12 @@ fn renderCallback(
         return .disarm;
     };
 
+    // CNDF: whatever happens below resolves a pending coalesced frame:
+    // it is updated, or there is nothing to show (hidden, unrealized,
+    // synchronized output, error). A later output wake decides again, so
+    // a frame that could not be reflected never turns into a retry loop.
+    t.clearCoalescePending();
+
     // If the display is now unrealized, release GPU resources now
     // we're on the render thread, and do not try to update and draw
     // this frame.
@@ -585,11 +730,17 @@ fn renderCallback(
     if (!t.flags.visible) return .disarm;
 
     // Update our frame data
-    t.renderer.updateFrame(
+    t.coalescer.counters.update += 1;
+    t.renderer.snapshot_output_generation = null;
+    if (t.renderer.updateFrame(
         t.state,
         t.flags.cursor_blink_visible,
-    ) catch |err|
-        log.warn("error rendering err={}", .{err});
+    )) {
+        // CNDF: only a snapshot that actually happened counts, with the
+        // generation read under the snapshot's own lock. Synchronized
+        // output leaves it null.
+        if (t.renderer.snapshot_output_generation) |gen| t.coalescer.reflect(gen);
+    } else |err| log.warn("error rendering err={}", .{err});
 
     // Draw
     t.drawFrame(false);
@@ -598,6 +749,14 @@ fn renderCallback(
     t.armAnimationTimer();
 
     return .disarm;
+}
+
+/// CNDF: forget a pending coalesced frame and release its display link
+/// keepalive. The watchdog may still fire; it does nothing then.
+fn clearCoalescePending(t: *Thread) void {
+    if (!t.coalescer.pending) return;
+    t.coalescer.pending = false;
+    t.renderer.setCoalescePending(false);
 }
 
 /// Schedule the animation timer for the renderer's next animation
@@ -761,6 +920,246 @@ fn cursorBlinkInterval() u64 {
     return CURSOR_BLINK_INTERVAL;
 }
 
+/// CNDF: the most recent display link tick, written by the CoreVideo
+/// callback thread and read by the renderer thread. The callback only
+/// records and notifies `draw_now`; all decisions happen on the renderer
+/// thread.
+pub const DisplayTick = struct {
+    /// Set by the renderer thread before the display link exists.
+    draw_now: ?*xev.Async = null,
+
+    /// Number of ticks recorded so far.
+    seq: std.atomic.Value(u64) = .init(0),
+
+    /// Awake clock nanoseconds of tick `seq`.
+    ns: std.atomic.Value(u64) = .init(0),
+
+    pub const Sample = struct { seq: u64, ns: u64 };
+
+    /// Called on the display link thread once per refresh.
+    pub fn record(self: *DisplayTick, now_ns: u64) void {
+        self.ns.store(now_ns, .monotonic);
+        _ = self.seq.fetchAdd(1, .release);
+    }
+
+    /// Called on the renderer thread. A tick racing with this may pair a
+    /// new `ns` with an old `seq`; that only skews one interval sample,
+    /// which the cadence filter tolerates.
+    pub fn load(self: *const DisplayTick) Sample {
+        const seq = self.seq.load(.acquire);
+        return .{ .seq = seq, .ns = self.ns.load(.monotonic) };
+    }
+};
+
+/// CNDF: render coalescing policy. Pure state, owned by the renderer
+/// thread, with time and generations passed in so it can be tested with
+/// a fake clock.
+///
+/// A wake is folded into the next display refresh ("wait") only when all
+/// of these hold; otherwise the frame is updated immediately, which is the
+/// upstream behavior:
+///   - coalescing is enabled
+///   - no immediate request (input, UI change, injected output, mailbox)
+///   - outside the input guard window after the last input
+///   - the display link is running and its period P has been observed
+///   - the native producer is not idle through the latest generation
+///   - at least `threshold_bytes` were parsed within the last P
+pub const Coalescer = struct {
+    /// Bulk output threshold within one display period. Initial policy
+    /// value to be validated, not tuned.
+    pub const threshold_bytes: u64 = 16 * 1024;
+
+    /// How long after user input coalescing stays bypassed.
+    pub const input_guard_ns: u64 = 50 * std.time.ns_per_ms;
+
+    /// Plausible display periods (240Hz .. 20Hz). Tick intervals outside
+    /// this range are gaps (link paused) or noise and are not learned.
+    const min_period_ns: u64 = 4 * std.time.ns_per_ms;
+    const max_period_ns: u64 = 50 * std.time.ns_per_ms;
+
+    /// Valid intervals needed before the period is trusted.
+    const period_samples_needed = 3;
+
+    const window_len = 32;
+
+    pub const Decision = enum {
+        /// Update the frame now (upstream path).
+        update,
+        /// A coalesced frame is already pending; nothing to do.
+        wait,
+        /// A coalesced frame just became pending: keep the display link
+        /// alive and arm the watchdog.
+        wait_new,
+    };
+
+    pub const Wake = struct {
+        now_ns: u64,
+        generation: u64,
+        idle_through: u64,
+        input_ns: u64,
+        immediate: bool,
+        vsync: bool,
+    };
+
+    const Sample = struct { ns: u64, generation: u64 };
+
+    enabled: bool = false,
+
+    /// Set while draining the mailbox, consumed by the next decision.
+    mailbox_immediate: bool = false,
+
+    /// A coalesced frame is waiting for the next tick (or the watchdog).
+    pending: bool = false,
+
+    /// The output generation contained in the last frame snapshot.
+    reflected: u64 = 0,
+
+    /// Display cadence.
+    tick_seq: u64 = 0,
+    tick_ns: u64 = 0,
+    period_ns: u64 = 0,
+    period_samples: u8 = 0,
+
+    /// Recent (time, generation) samples, oldest first from `head`.
+    window: [window_len]Sample = undefined,
+    window_count: usize = 0,
+    window_head: usize = 0,
+
+    counters: Counters = .{},
+
+    pub const Counters = struct {
+        update: u64 = 0,
+        coalesced: u64 = 0,
+        tick: u64 = 0,
+        tick_flush: u64 = 0,
+        idle_flush: u64 = 0,
+        input_flush: u64 = 0,
+        watchdog: u64 = 0,
+
+        pub fn format(self: Counters, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.print(
+                "update={} coalesced={} tick={} tick_flush={} idle_flush={} input_flush={} watchdog={}",
+                .{
+                    self.update,     self.coalesced,  self.tick,
+                    self.tick_flush, self.idle_flush, self.input_flush,
+                    self.watchdog,
+                },
+            );
+        }
+    };
+
+    pub fn onWake(self: *Coalescer, w: Wake) Decision {
+        self.record(w.now_ns, w.generation);
+
+        if (!self.enabled) return .update;
+
+        const update = update: {
+            if (w.immediate) break :update true;
+
+            if (w.input_ns != 0 and w.now_ns -| w.input_ns < input_guard_ns) {
+                if (self.pending) self.counters.input_flush += 1;
+                break :update true;
+            }
+
+            if (!w.vsync or !self.periodKnown(w.now_ns)) break :update true;
+
+            // Producer idle through everything parsed: show it now. A stale
+            // idle (older than the generation) does not count.
+            if (w.idle_through >= w.generation) {
+                if (self.pending) self.counters.idle_flush += 1;
+                break :update true;
+            }
+
+            if (self.bytesInPeriod(w.now_ns, w.generation) < threshold_bytes)
+                break :update true;
+
+            break :update false;
+        };
+        if (update) return .update;
+
+        self.counters.coalesced += 1;
+        if (self.pending) return .wait;
+        self.pending = true;
+        return .wait_new;
+    }
+
+    /// A frame snapshot containing `generation` completed.
+    pub fn reflect(self: *Coalescer, generation: u64) void {
+        self.reflected = @max(self.reflected, generation);
+    }
+
+    /// Record a display link tick read from `DisplayTick`.
+    pub fn onTick(self: *Coalescer, tick: DisplayTick.Sample) void {
+        if (tick.seq == self.tick_seq) return;
+        self.counters.tick += 1;
+        if (self.tick_seq != 0 and
+            tick.seq > self.tick_seq and
+            tick.ns > self.tick_ns)
+        {
+            const interval = (tick.ns - self.tick_ns) / (tick.seq - self.tick_seq);
+            if (interval >= min_period_ns and interval <= max_period_ns) {
+                self.period_ns = if (self.period_samples == 0)
+                    interval
+                else
+                    (self.period_ns * 3 + interval) / 4;
+                self.period_samples +|= 1;
+            }
+        }
+        self.tick_seq = tick.seq;
+        self.tick_ns = tick.ns;
+    }
+
+    /// Forget the observed cadence (start, restore, display change,
+    /// missed tick). Until it is learned again every wake updates
+    /// immediately.
+    pub fn resetCadence(self: *Coalescer) void {
+        self.period_samples = 0;
+        self.period_ns = 0;
+        self.tick_seq = 0;
+        self.tick_ns = 0;
+    }
+
+    /// The period is trusted and the link ticked recently enough that the
+    /// next tick is expected within it.
+    pub fn periodKnown(self: *const Coalescer, now_ns: u64) bool {
+        if (self.period_samples < period_samples_needed) return false;
+        return now_ns -| self.tick_ns <= 2 * self.period_ns;
+    }
+
+    /// Watchdog delay for a frame that just became pending: one period,
+    /// rounded up to whole milliseconds.
+    pub fn watchdogDelayMs(self: *const Coalescer) u64 {
+        const ns = @max(self.period_ns, min_period_ns);
+        return std.math.divCeil(u64, ns, std.time.ns_per_ms) catch unreachable;
+    }
+
+    /// Bytes parsed within the last period: from the newest sample at
+    /// least one period old. If the window doesn't reach that far back,
+    /// the oldest sample undercounts, which errs toward updating.
+    fn bytesInPeriod(self: *const Coalescer, now_ns: u64, generation: u64) u64 {
+        const cutoff = now_ns -| self.period_ns;
+        var base: ?u64 = null;
+        var i: usize = 0;
+        while (i < self.window_count) : (i += 1) {
+            const sample = self.window[(self.window_head + i) % window_len];
+            if (base == null) base = sample.generation;
+            if (sample.ns <= cutoff) base = sample.generation else break;
+        }
+        return generation -| (base orelse generation);
+    }
+
+    fn record(self: *Coalescer, now_ns: u64, generation: u64) void {
+        const sample: Sample = .{ .ns = now_ns, .generation = generation };
+        if (self.window_count < window_len) {
+            self.window[(self.window_head + self.window_count) % window_len] = sample;
+            self.window_count += 1;
+        } else {
+            self.window[self.window_head] = sample;
+            self.window_head = (self.window_head + 1) % window_len;
+        }
+    }
+};
+
 /// Schedules incremental terminal compression after renderer activity stops.
 ///
 /// This owns all renderer-specific compression state. The terminal decides
@@ -870,3 +1269,210 @@ const Compression = struct {
         };
     }
 };
+
+const test_ms = std.time.ns_per_ms;
+
+/// A coalescer that has learned a 60Hz-ish cadence (P = 16ms) with its
+/// last tick at `t_ns`.
+fn testCoalescer(t_ns: u64) Coalescer {
+    var c: Coalescer = .{ .enabled = true };
+    const p = 16 * test_ms;
+    var seq: u64 = 1;
+    while (seq <= 4) : (seq += 1) {
+        c.onTick(.{ .seq = seq, .ns = t_ns - (4 - seq) * p });
+    }
+    return c;
+}
+
+fn testWake(now: u64, gen: u64) Coalescer.Wake {
+    return .{
+        .now_ns = now,
+        .generation = gen,
+        .idle_through = 0,
+        .input_ns = 0,
+        .immediate = false,
+        .vsync = true,
+    };
+}
+
+test "Coalescer: small output updates immediately, bulk output waits" {
+    const testing = std.testing;
+    const t0: u64 = 1000 * test_ms;
+    var c = testCoalescer(t0);
+
+    // A trickle within the period: immediate.
+    try testing.expectEqual(.update, c.onWake(testWake(t0, 100)));
+    try testing.expectEqual(.update, c.onWake(testWake(t0 + 2 * test_ms, 4000)));
+
+    // Over the threshold within the last P: the first wake makes a frame
+    // pending, the next ones just wait (no new deadline).
+    try testing.expectEqual(.wait_new, c.onWake(testWake(t0 + 4 * test_ms, 20 * 1024)));
+    try testing.expect(c.pending);
+    try testing.expectEqual(.wait, c.onWake(testWake(t0 + 6 * test_ms, 40 * 1024)));
+}
+
+test "Coalescer: threshold is measured over the last period only" {
+    const testing = std.testing;
+    const t0: u64 = 1000 * test_ms;
+    var c = testCoalescer(t0);
+
+    _ = c.onWake(testWake(t0, 0));
+    // 20 KiB spread over far more than P: the window base is the newest
+    // sample at least P old, so only the recent bytes count.
+    _ = c.onWake(testWake(t0 + 100 * test_ms, 15 * 1024));
+    // The link kept ticking meanwhile.
+    c.onTick(.{ .seq = 11, .ns = t0 + 112 * test_ms });
+    try testing.expectEqual(.update, c.onWake(testWake(t0 + 117 * test_ms, 20 * 1024)));
+    // Exactly at the threshold within P: waits.
+    try testing.expectEqual(.wait_new, c.onWake(testWake(t0 + 118 * test_ms, 15 * 1024 + 16 * 1024)));
+}
+
+test "Coalescer: input guard boundary is exactly 50ms" {
+    const testing = std.testing;
+    const t0: u64 = 1000 * test_ms;
+    var c = testCoalescer(t0);
+    _ = c.onWake(testWake(t0, 0));
+
+    var w = testWake(t0 + 10 * test_ms, 64 * 1024);
+    w.input_ns = t0 + 10 * test_ms - Coalescer.input_guard_ns + 1;
+    try testing.expectEqual(.update, c.onWake(w));
+
+    w.input_ns = t0 + 10 * test_ms - Coalescer.input_guard_ns;
+    w.generation = 128 * 1024;
+    try testing.expectEqual(.wait_new, c.onWake(w));
+}
+
+test "Coalescer: pending frame is resolved by input, immediate and idle" {
+    const testing = std.testing;
+    const t0: u64 = 1000 * test_ms;
+
+    // Input while pending.
+    {
+        var c = testCoalescer(t0);
+        _ = c.onWake(testWake(t0, 0));
+        try testing.expectEqual(.wait_new, c.onWake(testWake(t0 + 1 * test_ms, 64 * 1024)));
+        var w = testWake(t0 + 2 * test_ms, 65 * 1024);
+        w.input_ns = t0 + 2 * test_ms;
+        try testing.expectEqual(.update, c.onWake(w));
+        try testing.expectEqual(@as(u64, 1), c.counters.input_flush);
+    }
+
+    // UI change (resize, config, focus...) while pending.
+    {
+        var c = testCoalescer(t0);
+        _ = c.onWake(testWake(t0, 0));
+        _ = c.onWake(testWake(t0 + 1 * test_ms, 64 * 1024));
+        var w = testWake(t0 + 2 * test_ms, 65 * 1024);
+        w.immediate = true;
+        try testing.expectEqual(.update, c.onWake(w));
+    }
+
+    // Producer idle through the latest generation while pending.
+    {
+        var c = testCoalescer(t0);
+        _ = c.onWake(testWake(t0, 0));
+        _ = c.onWake(testWake(t0 + 1 * test_ms, 64 * 1024));
+        var w = testWake(t0 + 2 * test_ms, 80 * 1024);
+        w.idle_through = 80 * 1024;
+        try testing.expectEqual(.update, c.onWake(w));
+        try testing.expectEqual(@as(u64, 1), c.counters.idle_flush);
+    }
+}
+
+test "Coalescer: stale idle does not release new output" {
+    const testing = std.testing;
+    const t0: u64 = 1000 * test_ms;
+    var c = testCoalescer(t0);
+    _ = c.onWake(testWake(t0, 0));
+
+    // Idle was published at 10 KiB, then a burst started.
+    var w = testWake(t0 + 2 * test_ms, 64 * 1024);
+    w.idle_through = 10 * 1024;
+    try testing.expectEqual(.wait_new, c.onWake(w));
+}
+
+test "Coalescer: disabled and no vsync always update" {
+    const testing = std.testing;
+    const t0: u64 = 1000 * test_ms;
+
+    var c = testCoalescer(t0);
+    c.enabled = false;
+    _ = c.onWake(testWake(t0, 0));
+    try testing.expectEqual(.update, c.onWake(testWake(t0 + 1 * test_ms, 64 * 1024)));
+
+    var d = testCoalescer(t0);
+    _ = d.onWake(testWake(t0, 0));
+    var w = testWake(t0 + 1 * test_ms, 64 * 1024);
+    w.vsync = false;
+    try testing.expectEqual(.update, d.onWake(w));
+}
+
+test "Coalescer: cadence must be learned and recent" {
+    const testing = std.testing;
+    const t0: u64 = 1000 * test_ms;
+
+    // Fewer than three valid intervals: unknown.
+    var c: Coalescer = .{ .enabled = true };
+    c.onTick(.{ .seq = 1, .ns = t0 });
+    c.onTick(.{ .seq = 2, .ns = t0 + 16 * test_ms });
+    c.onTick(.{ .seq = 3, .ns = t0 + 32 * test_ms });
+    try testing.expect(!c.periodKnown(t0 + 33 * test_ms));
+    c.onTick(.{ .seq = 4, .ns = t0 + 48 * test_ms });
+    try testing.expect(c.periodKnown(t0 + 49 * test_ms));
+    try testing.expectEqual(@as(u64, 16 * test_ms), c.period_ns);
+
+    // Ticks stopped for more than two periods: unknown again.
+    try testing.expect(c.periodKnown(t0 + 80 * test_ms));
+    try testing.expect(!c.periodKnown(t0 + 81 * test_ms));
+    _ = c.onWake(testWake(t0 + 81 * test_ms, 0));
+    try testing.expectEqual(.update, c.onWake(testWake(t0 + 82 * test_ms, 64 * 1024)));
+
+    // A pause gap is not learned as a period, but the link resuming
+    // makes the learned period usable again.
+    c.onTick(.{ .seq = 5, .ns = t0 + 500 * test_ms });
+    try testing.expectEqual(@as(u64, 16 * test_ms), c.period_ns);
+    try testing.expect(c.periodKnown(t0 + 501 * test_ms));
+
+    // Coalesced draw_now notifications skip ticks: averaged per tick.
+    c.onTick(.{ .seq = 7, .ns = t0 + 516 * test_ms });
+    try testing.expectEqual(@as(u64, 14 * test_ms), c.period_ns);
+
+    // Display change or watchdog: forget it.
+    c.resetCadence();
+    try testing.expect(!c.periodKnown(t0 + 517 * test_ms));
+}
+
+test "Coalescer: 120Hz cadence and watchdog delay" {
+    const testing = std.testing;
+    const t0: u64 = 1000 * test_ms;
+    var c: Coalescer = .{ .enabled = true };
+    const p: u64 = 8_333_333;
+    var seq: u64 = 1;
+    while (seq <= 5) : (seq += 1) c.onTick(.{ .seq = seq, .ns = t0 + seq * p });
+    try testing.expectEqual(p, c.period_ns);
+    try testing.expectEqual(@as(u64, 9), c.watchdogDelayMs());
+
+    var d = testCoalescer(t0);
+    try testing.expectEqual(@as(u64, 16), d.watchdogDelayMs());
+    d.resetCadence();
+    // Never zero, even without a period.
+    try testing.expect(d.watchdogDelayMs() > 0);
+}
+
+test "Coalescer: reflect keeps the newest snapshot generation" {
+    const testing = std.testing;
+    var c: Coalescer = .{ .enabled = true };
+    c.reflect(100);
+    c.reflect(50);
+    try testing.expectEqual(@as(u64, 100), c.reflected);
+    c.reflect(300);
+    try testing.expectEqual(@as(u64, 300), c.reflected);
+}
+
+test "Coalescer: repeated tick reads count once" {
+    const testing = std.testing;
+    var c = testCoalescer(1000 * test_ms);
+    const before = c.counters.tick;
+    c.onTick(.{ .seq = 4, .ns = 1000 * test_ms });
+    try testing.expectEqual(before, c.counters.tick);
+}

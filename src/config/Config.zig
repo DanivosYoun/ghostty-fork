@@ -1439,6 +1439,19 @@ input: RepeatableReadableIO = .{},
 /// already compressed remain compressed until their contents are accessed.
 @"scrollback-compression": bool = true,
 
+/// CNDF: coalesce frame updates for bulk pty output with the display refresh.
+///
+/// While the native pty read pipeline produces a sustained burst of output
+/// (at least 16 KiB within one display refresh period) and the display link
+/// is running, the terminal state is snapshotted at most once per display
+/// refresh instead of once per read batch. Keyboard, IME, paste and mouse
+/// input, UI changes, and the end of output are always rendered immediately.
+///
+/// This only affects how often frame data is rebuilt. Parsing, pty I/O, flow
+/// control and synchronized output are unchanged. macOS only; it has no
+/// effect without a running display link.
+@"cndf-render-coalesce": bool = false,
+
 /// Control when the scrollbar is shown to scroll the scrollback buffer.
 ///
 /// The default value is `system`.
