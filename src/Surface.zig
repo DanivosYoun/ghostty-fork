@@ -2622,7 +2622,20 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
 /// isn't guaranteed to happen immediately but it will happen as soon as
 /// practical.
 fn queueRender(self: *Surface) !void {
+    // CNDF: surface-initiated renders are UI changes; never coalesced.
+    self.renderer_state.coalesce.requestImmediate();
     try self.renderer_thread.wakeup.notify();
+}
+
+/// CNDF: a user input boundary (key press/repeat, IME, paste, mouse).
+/// Resolves any pending coalesced frame now and bypasses coalescing for
+/// a short guard window so the echo isn't held for a display tick. Call
+/// before anything that could close the surface.
+fn noteRenderInput(self: *Surface) void {
+    self.renderer_state.coalesce.noteInput(
+        rendererpkg.State.coalesceNowNs(global.io()),
+    );
+    self.renderer_thread.wakeup.notify() catch {};
 }
 
 /// Called by the apprt when the surface's display is realized.
@@ -2719,6 +2732,9 @@ pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) !void {
     // Crash metadata in case we crash in here
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
+
+    // CNDF: IME composition is an input boundary for render coalescing.
+    self.noteRenderInput();
 
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
@@ -2852,6 +2868,10 @@ pub fn keyCallback(
     // Crash metadata in case we crash in here
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
+
+    // CNDF: press/repeat are input boundaries for render coalescing.
+    // Before keybindings, which may close the surface.
+    if (event.action != .release) self.noteRenderInput();
 
     // Setup our inspector event if we have an inspector.
     var insp_ev: ?inspectorpkg.KeyEvent = if (self.inspector != null) ev: {
@@ -3643,6 +3663,9 @@ pub fn scrollCallback(
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
 
+    // CNDF: scrolling is an input boundary for render coalescing.
+    self.noteRenderInput();
+
     // Always show the mouse again if it is hidden
     if (self.mouse.hidden) self.showMouse();
 
@@ -3978,6 +4001,9 @@ pub fn mouseButtonCallback(
     defer crash.sentry.thread_state = null;
 
     // log.debug("mouse action={} button={} mods={}", .{ action, button, mods });
+
+    // CNDF: mouse buttons are input boundaries for render coalescing.
+    self.noteRenderInput();
 
     // If we have an inspector, we always queue a render
     if (self.inspector != null) {
@@ -4737,6 +4763,15 @@ pub fn cursorPosCallback(
     defer crash.sentry.thread_state = null;
 
     // log.debug("cursor pos x={} y={} mods={?}", .{ pos.x, pos.y, mods });
+
+    // CNDF: dragging (any button held) is an input boundary for render
+    // coalescing; plain hover is not.
+    for (self.mouse.click_state) |state| {
+        if (state == .press) {
+            self.noteRenderInput();
+            break;
+        }
+    }
 
     // If the position is negative, it is outside our viewport and
     // we need to clear any hover states.
@@ -6339,6 +6374,10 @@ fn completeClipboardPaste(
     allow_unsafe: bool,
 ) !void {
     if (data.len == 0) return;
+
+    // CNDF: paste (and committed text) is an input boundary for render
+    // coalescing.
+    self.noteRenderInput();
 
     const encode_opts: input.paste.Options = encode_opts: {
         // CNDF: a paste scrolls to the bottom. Runs after the unlock below.
