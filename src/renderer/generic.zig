@@ -1134,7 +1134,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         pub fn setCoalescePending(self: *Self, pending: bool) void {
             if (self.coalesce_pending == pending) return;
             self.coalesce_pending = pending;
-            self.syncDisplayLink(null, null);
+
+            // Releasing needs no sync of its own: the update that resolves
+            // the frame, or the next no-redraw draw, resyncs and lets the
+            // link stop. Syncing here would queue a main thread hop per
+            // coalesced frame.
+            if (pending) self.syncDisplayLink(null, null);
         }
 
         /// The cadence of continuous (draw-only) animation wakes,
