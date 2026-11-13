@@ -1405,6 +1405,15 @@ pub const ReadThread = struct {
         /// remaining batches and then exits.
         done: bool = false,
 
+        /// CNDF: set by the gather stage (under the mutex) while it waits
+        /// in the outer poll after draining the pty, and once it is done.
+        /// Together with `count == 0` (nothing published or being
+        /// parsed) this is the producer idle boundary for render
+        /// coalescing. Whichever stage completes the condition last
+        /// reports it, so the order in which they get there doesn't
+        /// matter.
+        gather_idle: bool = false,
+
         /// The buffer storage itself.
         bufs: [buffer_count][buffer_capacity]u8 = undefined,
     };
@@ -1462,7 +1471,7 @@ pub const ReadThread = struct {
         const gather_thread = std.Thread.spawn(
             .{},
             gatherMainPosix,
-            .{ fd, quit, &pipeline },
+            .{ fd, quit, &pipeline, io },
         ) catch |err| {
             // If we can't spawn a thread the process is already
             // doomed (every surface spawns several), so don't try
@@ -1492,7 +1501,7 @@ pub const ReadThread = struct {
 
             // The batch buffer is owned by this stage until we advance
             // the tail below, so it is safe to read outside the lock.
-            io.processOutput(batch);
+            io.processReadOutput(batch);
 
             {
                 pipeline.mutex.lockUncancelable(global.io());
@@ -1501,8 +1510,13 @@ pub const ReadThread = struct {
                 const wake = pipeline.count == 0 and
                     pipeline.bridging and
                     pipeline.idle_write_fd >= 0;
+                const idle = readerIdle(&pipeline);
                 pipeline.mutex.unlock(global.io());
                 pipeline.slot_free.signal(global.io());
+
+                // CNDF: we parsed the last batch after the gather stage
+                // went idle. Reported outside the pipeline mutex.
+                if (idle) io.readPipelineIdle();
 
                 // We ran out of batches while the gather stage is
                 // bridging a refill gap: interrupt its poll so it
@@ -1523,7 +1537,12 @@ pub const ReadThread = struct {
     /// bridging the kernel queue's refill gaps for saturated streams,
     /// and publishes each batch to the parse stage. This thread owns
     /// all fd monitoring, including the quit fd.
-    fn gatherMainPosix(fd: posix.fd_t, quit: posix.fd_t, pipeline: *Pipeline) void {
+    fn gatherMainPosix(
+        fd: posix.fd_t,
+        quit: posix.fd_t,
+        pipeline: *Pipeline,
+        io: *termio.Termio,
+    ) void {
         if (builtin.target.os.tag.isDarwin()) {
             internal_os.macos.pthread_setname_np(&"io-gather".*);
             setQosClass();
@@ -1534,8 +1553,10 @@ pub const ReadThread = struct {
         defer {
             pipeline.mutex.lockUncancelable(global.io());
             pipeline.done = true;
+            const idle = setGatherIdle(pipeline, true);
             pipeline.mutex.unlock(global.io());
             pipeline.batch_ready.signal(global.io());
+            if (idle) io.readPipelineIdle();
         }
 
         // The fds we poll: data on the pty, our quit notification,
@@ -1710,12 +1731,28 @@ pub const ReadThread = struct {
             // claim the next buffer without an intervening poll.
             if (total == buffer_capacity) continue;
 
+            // CNDF: the pty is drained. If the parse stage has nothing
+            // left either, the producer is idle; otherwise it reports
+            // that when it finishes the last batch.
+            {
+                pipeline.mutex.lockUncancelable(global.io());
+                const idle = setGatherIdle(pipeline, true);
+                pipeline.mutex.unlock(global.io());
+                if (idle) io.readPipelineIdle();
+            }
+
             // Wait for data. The idle fd is sliced off: the parse
             // stage only writes to it while we're bridging.
             _ = posix.poll(pollfds[0..2], -1) catch |err| {
                 log.warn("poll failed on read thread, exiting early err={}", .{err});
                 return;
             };
+
+            {
+                pipeline.mutex.lockUncancelable(global.io());
+                _ = setGatherIdle(pipeline, false);
+                pipeline.mutex.unlock(global.io());
+            }
 
             // If our quit fd is set, we're done.
             if (pollfds[1].revents & posix.POLL.IN != 0) {
@@ -1730,6 +1767,20 @@ pub const ReadThread = struct {
                 return;
             }
         }
+    }
+
+    /// CNDF: sets `gather_idle` and returns whether the producer is now
+    /// idle (gather idle and nothing published or being parsed). Caller
+    /// holds the pipeline mutex and reports idle after releasing it.
+    fn setGatherIdle(pipeline: *Pipeline, idle: bool) bool {
+        pipeline.gather_idle = idle;
+        return idle and pipeline.count == 0;
+    }
+
+    /// CNDF: whether the parse stage, having just consumed a batch, finds
+    /// the producer idle. Caller holds the pipeline mutex.
+    fn readerIdle(pipeline: *const Pipeline) bool {
+        return pipeline.count == 0 and pipeline.gather_idle;
     }
 
     /// Clears the bridging flag armed before a bridge poll, closing
@@ -2356,4 +2407,40 @@ test "init frees the env when it fails" {
         };
         try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
+}
+
+test "CNDF read pipeline idle: gather idle before last batch is parsed" {
+    const testing = std.testing;
+    var pipeline: ReadThread.Pipeline = .{};
+
+    // Gather published one batch, then drained the pty and went idle while
+    // the batch is still unparsed: not idle yet.
+    pipeline.count = 1;
+    try testing.expect(!ReadThread.setGatherIdle(&pipeline, true));
+
+    // Parse stage finishes the last batch: it reports idle.
+    pipeline.count = 0;
+    try testing.expect(ReadThread.readerIdle(&pipeline));
+}
+
+test "CNDF read pipeline idle: last batch parsed before gather goes idle" {
+    const testing = std.testing;
+    var pipeline: ReadThread.Pipeline = .{};
+
+    // Parse stage drains the ring while gather is still reading.
+    pipeline.count = 0;
+    try testing.expect(!ReadThread.readerIdle(&pipeline));
+
+    // Gather then hits EAGAIN with nothing in flight: it reports idle.
+    try testing.expect(ReadThread.setGatherIdle(&pipeline, true));
+}
+
+test "CNDF read pipeline idle: gather woke up again" {
+    const testing = std.testing;
+    var pipeline: ReadThread.Pipeline = .{};
+
+    _ = ReadThread.setGatherIdle(&pipeline, true);
+    try testing.expect(!ReadThread.setGatherIdle(&pipeline, false));
+    pipeline.count = 0;
+    try testing.expect(!ReadThread.readerIdle(&pipeline));
 }

@@ -44,6 +44,10 @@ demand: std.atomic.Value(u32) = .init(0),
 /// `yieldToDemand` knows the waiter had its turn.
 handoff_gen: std.atomic.Value(u32) = .init(0),
 
+/// CNDF: render coalescing signals shared by the output pipeline, the
+/// surface and the renderer thread. See `Coalesce`.
+coalesce: Coalesce = .{},
+
 /// How long `yieldToDemand` sleeps waiting for a demanding waiter to
 /// take its turn before giving up. This bounds how long the IO parse
 /// thread can stall if a wake is lost or the waiter is descheduled; a
@@ -102,6 +106,65 @@ pub fn yieldToDemand(self: *State, io: std.Io) void {
         gen,
         .{ .duration = .{ .raw = .fromNanoseconds(handoff_timeout_ns), .clock = .awake } },
     ) catch {};
+}
+
+/// CNDF: the cross-thread half of render coalescing (`cndf-render-coalesce`).
+/// The renderer thread owns all policy and scheduling; this only carries
+/// the facts it decides on. Every field is an atomic so producers can
+/// publish without taking the renderer's lock.
+pub const Coalesce = struct {
+    /// Cumulative bytes the native exec read pipeline has finished
+    /// parsing. Only advanced with `mutex` held, at the end of a parse, so
+    /// a frame snapshot taken under the same mutex reads exactly the
+    /// generation it contains. Other output paths (external_io, NoTap
+    /// injection, Windows) never advance it.
+    output_generation: std.atomic.Value(u64) = .init(0),
+
+    /// The `output_generation` at which the native read pipeline last went
+    /// idle: the gather stage drained the pty (EAGAIN/EOF) and no batch was
+    /// published or being parsed. A value older than `output_generation`
+    /// is stale and does not mean the producer is idle.
+    idle_through_generation: std.atomic.Value(u64) = .init(0),
+
+    /// Monotonic (awake clock) nanoseconds of the most recent user input,
+    /// 0 if none. Coalescing is bypassed for a while after this.
+    input_ns: std.atomic.Value(u64) = .init(0),
+
+    /// Set by any wake that must not be coalesced (input, UI changes,
+    /// output paths without an idle contract). Consumed by the renderer.
+    immediate: std.atomic.Value(bool) = .init(false),
+
+    /// Advance the output generation. Caller holds `State.mutex` and has
+    /// just finished parsing `len` bytes from the native read pipeline.
+    pub fn outputParsed(self: *Coalesce, len: usize) void {
+        _ = self.output_generation.fetchAdd(len, .release);
+    }
+
+    /// Publish that the native producer is idle through the current
+    /// generation. Never blocks.
+    pub fn outputIdle(self: *Coalesce) void {
+        const gen = self.output_generation.load(.acquire);
+        _ = self.idle_through_generation.fetchMax(gen, .release);
+    }
+
+    /// Ask that the next renderer wake update the frame immediately.
+    /// The caller still has to wake the renderer.
+    pub fn requestImmediate(self: *Coalesce) void {
+        self.immediate.store(true, .release);
+    }
+
+    /// Record user input at `now_ns` (awake clock) and request an
+    /// immediate update. The caller still has to wake the renderer.
+    pub fn noteInput(self: *Coalesce, now_ns: u64) void {
+        self.input_ns.store(now_ns, .release);
+        self.requestImmediate();
+    }
+};
+
+/// Monotonic (awake clock) nanoseconds, the clock used by `Coalesce`.
+pub fn coalesceNowNs(io: std.Io) u64 {
+    const ns = std.Io.Timestamp.now(io, .awake).toNanoseconds();
+    return @intCast(@max(ns, 1));
 }
 
 pub const Mouse = struct {
@@ -232,4 +295,32 @@ test "preedit range shifts left at right edge" {
     try testing.expectEqual(@as(terminalpkg.size.CellCountInt, 8), range.start);
     try testing.expectEqual(@as(terminalpkg.size.CellCountInt, 9), range.end);
     try testing.expectEqual(@as(usize, 0), range.cp_offset);
+}
+
+test "CNDF coalesce: idle is through a generation, and goes stale" {
+    const testing = std.testing;
+    var c: Coalesce = .{};
+
+    c.outputParsed(1000);
+    c.outputIdle();
+    try testing.expectEqual(@as(u64, 1000), c.idle_through_generation.load(.acquire));
+
+    // New output after the idle: the old idle no longer covers it.
+    c.outputParsed(10);
+    try testing.expect(c.idle_through_generation.load(.acquire) <
+        c.output_generation.load(.acquire));
+
+    // Idle never moves backwards.
+    c.idle_through_generation.store(5000, .release);
+    c.outputIdle();
+    try testing.expectEqual(@as(u64, 5000), c.idle_through_generation.load(.acquire));
+}
+
+test "CNDF coalesce: input records time and requests immediate" {
+    const testing = std.testing;
+    var c: Coalesce = .{};
+    try testing.expect(!c.immediate.load(.acquire));
+    c.noteInput(1234);
+    try testing.expectEqual(@as(u64, 1234), c.input_ns.load(.acquire));
+    try testing.expect(c.immediate.load(.acquire));
 }

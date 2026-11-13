@@ -646,6 +646,8 @@ pub fn resetSynchronizedOutput(self: *Termio) void {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     self.terminal.modes.set(.synchronized_output, false);
+    // CNDF: the held-back frame is due now, not at the next coalesced tick.
+    self.renderer_state.coalesce.requestImmediate();
     self.renderer_wakeup.notify() catch {};
 }
 
@@ -733,6 +735,8 @@ pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
         self.terminal.screens.active.scroll(.{ .delta_prompt = delta });
     }
 
+    // CNDF: a viewport jump is a UI change, never coalesced.
+    self.renderer_state.coalesce.requestImmediate();
     try self.renderer_wakeup.notify();
 }
 
@@ -773,6 +777,34 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
     self.searchNotify(true);
 }
 
+/// CNDF: Process a batch from the native exec read pipeline. Identical to
+/// `processOutput`, but also advances the render coalescing output
+/// generation while the lock is still held, so a frame snapshot sees the
+/// bytes and their generation together. Only the posix exec read pipeline
+/// calls this; it is the only path with a producer idle contract (see
+/// `renderer.State.Coalesce`).
+pub fn processReadOutput(self: *Termio, buf: []const u8) void {
+    {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        self.processOutputLocked(buf);
+        self.renderer_state.coalesce.outputParsed(buf.len);
+    }
+
+    // CNDF: report the mutation to the search bridge outside the lock.
+    self.searchNotify(true);
+}
+
+/// CNDF: Publish that the native read pipeline is idle (see
+/// `renderer.State.Coalesce.idle_through_generation`) and wake the
+/// renderer so it can flush a coalesced frame without waiting. Safe from
+/// either pipeline thread; never blocks. Must not be called with the
+/// pipeline mutex held.
+pub fn readPipelineIdle(self: *Termio) void {
+    self.renderer_state.coalesce.outputIdle();
+    self.renderer_wakeup.notify() catch {};
+}
+
 /// CNDF: Process output WITHOUT firing the session-share read_pty tap.
 ///
 /// Used by the session-share viewer path
@@ -790,6 +822,9 @@ pub fn processOutputNoTap(self: *Termio, buf: []const u8) void {
     {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
+        // CNDF: injected output has no producer idle contract, so it is
+        // never coalesced. Requested before the parse wakes the renderer.
+        self.renderer_state.coalesce.requestImmediate();
         self.processOutputLockedTapped(buf, false);
     }
 
